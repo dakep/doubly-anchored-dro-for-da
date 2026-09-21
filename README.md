@@ -133,3 +133,7 @@ quarto render appl_fashion_results.qmd
 - `plotting-utils.R` contains shared R plotting colors and themes used by both Quarto documents.
 - `autoenc/` stores trained autoencoder checkpoints; `results/` and `figures/` contain generated tables and plots.
 - `renv.lock`, `renv/activate.R`, and `renv/settings.json` record and configure the R package environment used to render the Quarto documents.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for the full text.
