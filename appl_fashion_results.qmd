@@ -1,0 +1,676 @@
+---
+title: "Results from the F-MNIST dataset"
+date: last-modified
+format:
+  html:
+    embed-resources: true
+
+---
+
+## Setup
+
+```{r}
+#| label: setup
+#| include: false
+#| echo: false
+library(tidyverse)
+library(gridExtra)
+library(cowplot)
+library(ggpubr)
+library(ggh4x)
+library(lamW)
+library(kableExtra)
+source("plotting-utils.R")
+
+NOISE_TYPE <- 'laplace'
+NOISE_SD <- 0.15
+NW_BW <- 10
+
+dev_pdf <- function (filename, width, height, .path = "figures") {
+  if (!dir.exists(.path)) {
+    dir.create(.path, mode = '0755', recursive = TRUE)
+  }
+  if (isTRUE(capabilities('cairo'))) {
+    cairo_pdf(file.path(.path, str_remove(basename(filename), coll("-1"))),
+              fallback_resolution = 600,
+              antialias = 'default',
+              width = width,
+              height = height)
+  } else {
+    pdf(file.path(.path, str_remove(basename(filename), coll("-1"))),
+        width = width,
+        height = height)
+  }
+}
+
+knitr::opts_chunk$set(fig.width  = 6,
+                      fig.height = 3,
+                      out.width  = "100%",
+                      dev        = c('png', 'dev_pdf'),
+                      fig.ext    = c('png', 'pdf'),
+                      echo       = FALSE,
+                      warning    = FALSE,
+                      error      = FALSE,
+                      message    = FALSE)
+```
+
+## Sensitivity analysis
+
+```{r}
+prob_res <- list.files("results", pattern = sprintf("Pullover_Coat_noise=laplace_%.2f_compute_probabilities_.+_bw%.2f_seed1.csv",
+                                                        NOISE_SD, NW_BW),
+                       full.names = TRUE) |>
+  map(~ read_csv(.x, na = c("", "NA", "nan"), col_types = 'cnnnc'))
+
+# Z_S <- prob_res |>
+#   filter(str_starts(name, 'Z_S')) |>
+#   select(values...) |>
+#   separate_wider_delim(cols = values..., delim = ",", names_sep = '') |>
+#   apply(1, as.numeric)
+#
+# Z_T_clean <- prob_res |>
+#   filter(str_starts(name, 'Z_T_clean')) |>
+#   select(values...) |>
+#   separate_wider_delim(cols = values..., delim = ",", names_sep = '') |>
+#   apply(1, as.numeric)
+
+# Z_T_noise <- prob_res |>
+#   map(\(x) {
+#     x |>
+#       filter(str_starts(name, 'Z_T_noise')) |>
+#       select(values...) |>
+#       separate_wider_delim(cols = values..., delim = ",", names_sep = '') |>
+#       apply(1, as.numeric)
+#   })
+
+br_weights <- local({
+  tmp <- prob_res |>
+    map(\(x) {
+      x |>
+        filter(str_starts(name, 'wgt')) |>
+        separate_longer_delim(cols = values..., delim = ",") |>
+        mutate(wgt = as.numeric(values...)) |>
+        select(-values...) |>
+        group_by(name, alpha, gamma, nu) |>
+        mutate(row = seq_along(wgt)) |>
+        ungroup() |>
+        mutate(type = if_else(str_detect(name, "agn"),
+                              "loss-agnostic",
+                              "loss-adversarial"))
+    })
+
+  bind_rows(tmp[[1]] |>
+              filter(type == 'loss-agnostic'),
+            tmp |>
+              map_dfr(\(brw) {
+                brw |>
+                  filter(type == 'loss-adversarial')
+              }) |>
+              group_by(type, name, alpha, gamma, nu, row) |>
+              summarize(wgt = first(wgt), .groups = 'drop'))
+})
+
+nw_probs <- local({
+  tmp <- prob_res |>
+    map(\(x) {
+      x |>
+        filter(str_starts(name, 'prob')) |>
+        separate_longer_delim(cols = values..., delim = ",") |>
+        mutate(prob = as.numeric(values...)) |>
+        select(-values...) |>
+        group_by(name, alpha, gamma, nu) |>
+        mutate(row = seq_along(prob)) |>
+        ungroup() |>
+        mutate(type = if_else(str_detect(name, "agn"),
+                              "loss-agnostic",
+                              "loss-adversarial"))
+    })
+
+  bind_rows(tmp[[1]] |>
+              filter(type == 'loss-agnostic'),
+            tmp |>
+              map_dfr(\(brw) {
+                brw |>
+                  filter(type == 'loss-adversarial')
+              }) |>
+              group_by(type, name, alpha, gamma, nu, row) |>
+              summarize(prob = first(prob), .groups = 'drop'))
+})
+```
+
+
+```{r}
+#| label: compute-sensitivity-metrics
+sens_entropy <- nw_probs |>
+  mutate(name = str_remove(name, 'prob_a[gndv]{2}_') |>
+           str_replace('_', '/') |>
+           str_to_upper(),
+         name = recode_values(name,
+                              'KL/KL' ~ 'paste("KL/KL")',
+                              'HD/HD' ~ 'paste("HD/HD")',
+                              'KL/HD' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |>
+           fct_relevel('paste("KL/KL")', 'paste("HD/HD")'),
+         type = str_to_sentence(type) |>
+           str_replace(fixed('-'), ' ') |>
+           fct_inorder()) |>
+  filter(is.na(gamma) | gamma %in% c(0)) |>
+  group_by(name, type, alpha, nu) |>
+  summarize(entropy = -sum(prob * log(prob) + (1 - prob) * log(1 - prob)),
+            .groups = 'drop')
+
+sens_neff <- br_weights |>
+  mutate(name = str_remove(name, 'wgt_a[gndv]{2}_') |>
+           str_replace('_', '/') |>
+           str_to_upper(),
+         name = recode_values(name,
+                              'KL/KL' ~ 'paste("KL/KL")',
+                              'HD/HD' ~ 'paste("HD/HD")',
+                              'KL/HD' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |>
+           fct_relevel('paste("KL/KL")', 'paste("HD/HD")'),
+         type = str_to_sentence(type) |>
+           str_replace(fixed('-'), ' ') |>
+           fct_inorder()) |>
+  filter(is.na(gamma) | gamma %in% c(0)) |>
+  group_by(name, type, alpha, nu) |>
+  mutate(wgt_std = wgt / sum(wgt)) |>
+  summarize(neff = 1 / sum(wgt_std^2),
+            .groups = 'drop')
+
+sens_class_prop <- nw_probs |>
+  mutate(name = str_remove(name, 'prob_a[gndv]{2}_') |>
+           str_replace('_', '/') |>
+           str_to_upper(),
+         name = recode_values(name,
+                              'KL/KL' ~ 'paste("KL/KL")',
+                              'HD/HD' ~ 'paste("HD/HD")',
+                              'KL/HD' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |>
+           fct_relevel('paste("KL/KL")', 'paste("HD/HD")'),
+         type = str_to_sentence(type) |>
+           str_replace(fixed('-'), ' ') |>
+           fct_inorder()) |>
+  filter(is.na(gamma) | gamma %in% c(0)) |>
+  group_by(name, type, alpha, nu) |>
+  summarize(prop_0 = mean(prob < 0.5),
+            lor     = log(prop_0) - log(1 - prop_0),
+            .groups = 'drop')
+```
+
+### Selecting $\nu$
+
+```{r}
+NU_COLOR_PALETTE <- c('#2d004b','#2166ac','#7fbc41',
+                      '#d73027','#92c5de','#276419',
+                      '#8073ac','#67001f','#ff7f00',
+                      '#c51b7d','#4d4d4d')
+```
+
+
+```{r}
+#| label: entropy-sensitivity-nu
+sens_nu_entr_pl <- sens_entropy |>
+  filter(!is.na(nu), !is.na(entropy)) |>
+  group_by(name, nu) |>
+  mutate(label = if_else(alpha >= max(alpha) - 1e-8,
+                         sprintf("nu==%.3f", nu),
+                         NA_character_),
+         alpha_label = alpha + 0.01) |>
+  ungroup() |>
+  group_by(name) |>
+  mutate(nu_col = factor(sprintf("%.4f", nu)) |>
+           fct_relabel(~ as.character(seq_along(.x)))) |>
+  ungroup() |>
+  filter(str_detect(name, fixed("HD/HD")) |
+           str_detect(name, fixed("KL/KL")) |
+           str_detect(name, fixed("gamma==0.0"))) |>
+  ggplot(aes(x = alpha, y = entropy, color = nu_col)) +
+  geom_line() +
+  geom_label(aes(x = alpha_label, label = label), size = 2, parse = TRUE, na.rm = TRUE, hjust = 0) +
+  facet_grid(cols = vars(name), labeller = label_parsed) +
+  scale_x_continuous(expand = expansion(mult = 0, add = c(0.01, 0.25)),
+                     breaks = seq(0.05, 0.95, by = 0.30)) +
+  scale_color_manual(values = NU_COLOR_PALETTE, guide = 'none') +
+  plottheme() +
+  labs(x = expression(alpha),
+       y = "Entropy")
+```
+
+```{r}
+#| label: neff-sensitivity-nu
+sens_nu_neff_pl <- sens_neff |>
+  filter(!is.na(nu), !is.na(neff)) |>
+  group_by(name, nu) |>
+  mutate(label = if_else(alpha >= max(alpha) - 1e-8,
+                         sprintf("nu==%.3f", nu),
+                         NA_character_),
+         alpha_label = alpha + 0.01) |>
+  ungroup() |>
+  group_by(name) |>
+  mutate(nu_col = factor(sprintf("%.4f", nu)) |>
+           fct_relabel(~ as.character(seq_along(.x)))) |>
+  ungroup() |>
+  filter(str_detect(name, fixed("HD/HD")) |
+           str_detect(name, fixed("KL/KL")) |
+           str_detect(name, fixed("gamma==0.0"))) |>
+  ggplot(aes(x = alpha, y = neff, color = nu_col)) +
+  geom_line() +
+  geom_label(aes(x = alpha_label, label = label), size = 2, parse = TRUE, na.rm = TRUE, hjust = 0) +
+  facet_grid(cols = vars(name), labeller = label_parsed) +
+  scale_x_continuous(expand = expansion(mult = 0, add = c(0.01, 0.25)),
+                     breaks = seq(0.05, 0.95, by = 0.30)) +
+  scale_color_manual(values = NU_COLOR_PALETTE, guide = 'none') +
+  scale_y_continuous(breaks = seq(3000, 12000, by = 3000),
+                     labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+  plottheme() +
+  labs(x = expression(alpha),
+       y = "Eff. sample size")
+```
+
+```{r}
+#| label: class-prop-sensitivity-nu
+sens_nu_class_prop_pl <- sens_class_prop |>
+  filter(!is.na(nu), !is.na(prop_0)) |>
+  group_by(name, nu) |>
+  mutate(label = if_else(alpha >= max(alpha) - 1e-8,
+                         sprintf("nu==%.3f", nu),
+                         NA_character_),
+         alpha_label = alpha + 0.01) |>
+  ungroup() |>
+  group_by(name) |>
+  mutate(nu_col = factor(sprintf("%.3f", nu)) |>
+           fct_relabel(~ as.character(seq_along(.x)))) |>
+  ungroup() |>
+  filter(str_detect(name, fixed("HD/HD")) |
+           str_detect(name, fixed("KL/KL")) |
+           str_detect(name, fixed("gamma==0.0"))) |>
+  ggplot(aes(x = alpha, y = prop_0, color = nu_col)) +
+  geom_line() +
+  geom_label(aes(x = alpha_label, label = label), size = 2, parse = TRUE, na.rm = TRUE, hjust = 0) +
+  facet_grid(cols = vars(name), labeller = label_parsed) +
+  scale_x_continuous(expand = expansion(mult = 0, add = c(0.01, 0.25)),
+                     breaks = seq(0.05, 0.95, by = 0.30)) +
+  scale_color_manual(values = NU_COLOR_PALETTE, guide = 'none') +
+  plottheme() +
+  labs(x = expression(alpha),
+       y = "Prop. of Pullover")
+```
+
+```{r}
+#| label: fmnist-sensitivity-nu-combined
+#| fig-width: 6
+#| fig-height: 6
+phs <- c(0.345, 0.305)
+phs <- c(phs, 1 - sum(phs))
+cowplot::ggdraw() +
+  cowplot::draw_plot(sens_nu_neff_pl +
+                       theme(plot.margin = margin(0.2, 0.4, 0.2, 0.01, 'lines'),
+                             axis.title.x = element_blank(),
+                             axis.ticks.x = element_blank(),
+                             axis.text.x = element_blank(),
+                             axis.title.y = element_text(margin = margin(r = 0.26, unit = 'lines'))),
+                     y = sum(phs[1:2]), height = phs[[3]]) +
+  cowplot::draw_plot(sens_nu_entr_pl +
+                       theme(plot.margin = margin(0.2, 0.4, 0.2, 0.01, 'lines'),
+                             axis.title.x = element_blank(),
+                             axis.ticks.x = element_blank(),
+                             axis.text.x = element_blank(),
+                             strip.text = element_blank(),
+                             axis.title.y = element_text(margin = margin(r = 0.05, unit = 'lines'))),
+                     y = phs[1], height = phs[[2]]) +
+  cowplot::draw_plot(sens_nu_class_prop_pl +
+                       theme(strip.text = element_blank(),
+                             axis.title.y = element_text(margin = margin(r = 0.54, unit = 'lines')),
+                             plot.margin = margin(0.2, 0.4, 0.2, 0.01, 'lines')),
+                     y = 0.0, height = phs[[1]])
+```
+
+
+From these plots, the optimal $\nu$ for the different bridges are selected as follows:
+
+```{r}
+optim_adv <- tibble(
+  name        = c( 'KL/KL',  'HD/HD', 'KL/HD', 'KL/HD', 'KL/HD'),
+  gamma       = c(NA_real_, NA_real_,    -0.5,     0.0,     2.0),
+  selected_nu = c(0.0158,     1.0000,  0.0100,  0.1000,  0.3981)
+) |>
+  mutate(model = recode_values(name,
+                               'KL/KL' ~ 'nw_adv_klkl',
+                               'HD/HD' ~ 'nw_adv_hdhd',
+                               'KL/HD' ~ 'nw_adv_klhd'),
+         name = recode_values(name,
+                              'KL/KL' ~ 'paste("KL/KL")',
+                              'HD/HD' ~ 'paste("HD/HD")',
+                              'KL/HD' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |>
+           fct_relevel('paste("KL/KL")', 'paste("HD/HD")')) |>
+  filter(is.na(gamma) | gamma == 0)
+```
+
+
+### For selected $\nu$
+
+```{r}
+#| label: entropy-sensitivity
+#| fig-width: 6
+#| fig-height: 3
+sens_entroyp_pl <- sens_entropy |>
+  left_join(optim_adv, join_by(name)) |>
+  filter(type == 'Loss agnostic' | abs(nu - selected_nu) < 1e-4) |>
+  ggplot(aes(x = alpha, y = entropy, color = name)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(aes(shape = name), size = 3) +
+  scale_color_manual(values = unname(COLORPAL[c('black', 'orange', 'blue', 'green', 'lightblue')]),
+                     labels = scales::parse_format()) +
+  scale_shape_manual(values = c(1, 0, 16, 15, 17),
+                     labels = scales::parse_format()) +
+  scale_x_continuous(breaks = seq(0.05, 0.95, by = 0.30),
+                     limits = c(0.05, 1.01)) +
+  facet_grid(cols = vars(type)) +
+  plottheme() +
+  theme(legend.position = 'bottom',
+        legend.direction = 'horizontal') +
+  labs(x = expression(alpha),
+       y = "Entropy",
+       color = "Bridge",
+       shape = "Bridge")
+sens_entroyp_pl
+```
+
+```{r}
+#| label: neff-sensitivity
+#| fig-width: 6
+#| fig-height: 3
+sens_neff_pl <- sens_neff |>
+  left_join(optim_adv, join_by(name)) |>
+  filter(type == 'Loss agnostic' | abs(nu - selected_nu) < 1e-4) |>
+  ggplot(aes(x = alpha, y = neff, color = name)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(aes(shape = name), size = 3) +
+  scale_color_manual(values = unname(COLORPAL[c('black', 'orange', 'blue', 'green', 'lightblue')]),
+                     labels = scales::parse_format()) +
+  scale_shape_manual(values = c(1, 0, 16, 15, 17),
+                     labels = scales::parse_format()) +
+  scale_x_continuous(breaks = seq(0.05, 0.95, by = 0.30),
+                     limits = c(0.05, 1.01)) +
+  scale_y_continuous(limits = c(2900, 12000),
+                     labels = scales::label_number(scale_cut = scales::cut_short_scale()),
+                     breaks = seq(3000, 12000, by = 3000)) +
+  facet_grid(cols = vars(type)) +
+  plottheme() +
+  theme(legend.position = 'bottom',
+        legend.direction = 'horizontal') +
+  labs(x = expression(alpha),
+       y = "Eff. sample size",
+       color = "Bridge",
+       shape = "Bridge")
+sens_neff_pl
+```
+
+```{r}
+#| label: class-imbalance-sensitivity
+#| fig-width: 6
+#| fig-height: 3
+sens_class_prop_pl <- sens_class_prop |>
+  left_join(optim_adv, join_by(name)) |>
+  filter(type == 'Loss agnostic' | abs(nu - selected_nu) < 1e-4) |>
+  ggplot(aes(x = alpha, y = prop_0, color = name)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(aes(shape = name), size = 3) +
+  scale_color_manual(values = unname(COLORPAL[c('black', 'orange', 'blue', 'green', 'lightblue')]),
+                     labels = scales::parse_format()) +
+  scale_shape_manual(values = c(1, 0, 16, 15, 17),
+                     labels = scales::parse_format()) +
+  scale_x_continuous(breaks = seq(0.05, 0.95, by = 0.30),
+                     limits = c(0.05, 1.01)) +
+  scale_y_continuous(limits = c(0.5, 1)) +
+  facet_grid(cols = vars(type)) +
+  plottheme() +
+  theme(legend.position = 'bottom',
+        legend.direction = 'horizontal') +
+  labs(x = expression(alpha),
+       y = "Prop. of Pullover",
+       color = "Bridge",
+       shape = "Bridge")
+sens_class_prop_pl
+```
+
+## Target accuracy
+
+```{r}
+#| label: load-results
+res <- list.files("results",
+                  pattern = sprintf("results_Pullover_Coat_aedim10_%s_sd%.2f_bw%.2f_kernepanechnikov_repl\\d+\\.csv",
+                                    NOISE_TYPE, NOISE_SD, NW_BW),
+                  full.names = TRUE) |>
+  map_dfr(~ read_csv(.x, show_col_types = FALSE))
+
+res_sum <- res |>
+  mutate(alpha = round(alpha, 2),
+         nu = if_else(is.na(nu), NA_character_, sprintf("%.4f", nu))) |>
+  group_by(noise_type, noise_sd, model, alpha, gamma, nu) |>
+  summarize(across(c(accuracy, auc, brier, f1), list(mean = mean, sd = sd)),
+            nrepl = n(),
+            .groups = 'drop') |>
+  mutate(bridge = str_extract(model, "hdhd|klkl|klhd") |>
+           str_to_upper() |>
+           fct_relevel('KLKL', "HDHD"),
+         type = case_when(is.na(alpha) ~ "baseline",
+                          str_detect(model, "adv") ~ "loss-adversarial",
+                          TRUE ~ "loss-agnostic"),
+         name = case_when(type == "baseline" ~ str_replace(model, "_", " ") |>
+                            str_to_title(),
+                          TRUE ~ bridge)
+  )
+```
+
+The baseline accuracy is:
+
+```{r}
+res_sum |>
+  filter(type == 'baseline') |>
+  select(model, ends_with('_mean'), ends_with('_sd')) |>
+  kbl()
+```
+
+```{r}
+#| label: target-accuracy-plots
+#| fig-height: 2.5
+target_acc_pl <- bind_rows(res_sum |>
+            filter(type == 'loss-agnostic',
+                   is.na(gamma) | gamma %in% c(-0.5, 0, 2)),
+          res_sum |>
+            filter(type == 'loss-adversarial') |>
+            semi_join(select(optim_adv, model, gamma, selected_nu) |>
+                         mutate(nu = sprintf("%.4f", selected_nu)),
+                       join_by(model, gamma, nu))) |>
+  filter(is.na(gamma) | abs(gamma) < 1e-12) |>
+  mutate(name = recode_values(name,
+                              'KLKL' ~ 'paste("KL/KL")',
+                              'HDHD' ~ 'paste("HD/HD")',
+                              'KLHD' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |>
+           fct_relevel('paste("KL/KL")', 'paste("HD/HD")'),
+         type = recode_values(type,
+                              'loss-agnostic' ~ "Loss agnostic",
+                              'loss-adversarial' ~ "Loss adversarial") |>
+           fct_inorder()) |>
+  ggplot(aes(x = alpha, y = accuracy_mean, color = name)) +
+  geom_line(linewidth = 0.8) +
+  geom_linerange(aes(ymin = accuracy_mean - accuracy_sd,
+                     ymax = accuracy_mean + accuracy_sd)) +
+  geom_point(aes(shape = name), size = 3) +
+  geom_hline(yintercept = res_sum |>
+               filter(model == "nw_src_clean") |>
+               pull(accuracy_mean),
+             linetype = "dashed", color = "gray30") +
+  geom_hline(yintercept = res_sum |>
+               filter(model == "nw_src") |>
+               pull(accuracy_mean),
+             linetype = "dashed", color = "gray30") +
+  scale_color_manual(values = unname(COLORPAL[c('black', 'orange', 'blue', 'green', 'lightblue', 'magenta')]),
+                     labels = scales::parse_format()) +
+  scale_shape_manual(values = c(1, 0, 16, 15, 17, 18),
+                     labels = scales::parse_format()) +
+  scale_y_continuous(breaks = seq(0.64, 0.80, by = 0.04)) +
+  scale_x_continuous(breaks = seq(0.05, 0.95, by = 0.30)) +
+  coord_cartesian(ylim = c(0.64, 0.80)) +
+  facet_grid(cols = vars(type)) +
+  plottheme() +
+  theme(legend.position = 'bottom',
+        legend.direction = 'horizontal') +
+  labs(x = expression(alpha),
+       y = "Accuracy",
+       color = "Bridge",
+       shape = "Bridge")
+
+target_acc_pl
+```
+
+## Combined plot
+
+```{r}
+#| label: fmnist-target-accuracy-sensitivity-combined
+#| fig-width: 6
+#| fig-height: 7
+phs <- c(0.33, 0.21, 0.21)
+phs <- c(phs, 1 - sum(phs))
+cowplot::ggdraw() +
+  cowplot::draw_plot(sens_neff_pl +
+                       theme(legend.position = 'none',
+                             axis.title.y = element_text(margin = margin(r = 0.29, unit = 'lines')),
+                             plot.margin = margin(0.2, 0.4, 0.2, 0.1, 'lines'),
+                             axis.title.x = element_blank(),
+                             axis.ticks.x = element_blank(),
+                             axis.text.x = element_blank()),
+                     y = sum(phs[1:3]), height = phs[[4]]) +
+  cowplot::draw_plot(sens_class_prop_pl +
+                       theme(legend.position = 'none',
+                             plot.margin = margin(0.2, 0.4, 0.2, 0.1, 'lines'),
+                             axis.title.x = element_blank(),
+                             axis.ticks.x = element_blank(),
+                             axis.text.x = element_blank(),
+                             strip.text = element_blank(),
+                             axis.title.y = element_text(margin = margin(r = 0.5, unit = 'lines'))),
+                     y = sum(phs[1:2]), height = phs[[3]]) +
+  cowplot::draw_plot(sens_entroyp_pl +
+                       theme(legend.position = 'none',
+                             axis.title.y = element_text(margin = margin(r = 0.07, unit = 'lines')),
+                             plot.margin = margin(0.2, 0.4, 0.2, 0.1, 'lines'),
+                             axis.title.x = element_blank(),
+                             axis.ticks.x = element_blank(),
+                             axis.text.x = element_blank(),
+                             strip.text = element_blank()),
+                     y = phs[1], height = phs[[2]]) +
+  cowplot::draw_plot(target_acc_pl+
+                       theme(strip.text = element_blank(),
+                             legend.margin = margin(),
+                             axis.title.y = element_text(margin = margin(r = 0.2, unit = 'lines')),
+                             plot.margin = margin(0.2, 0.4, 0.2, 0.1, 'lines')),
+                     y = 0.0, height = phs[[1]])
+```
+
+## Density of bridge weights
+
+```{r}
+#| label: fminst-bridge-weights-agnostic-density
+#| fig-width: 6
+#| fig-height: 2
+`%ain%` <- function(x, y) {
+  contained <- vapply(y, FUN.VALUE = logical(length(x)), FUN = \(ys) abs(x - ys) < 1e-8) |>
+    rowSums()
+  contained > 0L
+}
+
+br_wgt_gd <- guide_legend(title = "Bridge", override.aes = list(alpha = 1))
+
+br_weights |>
+  filter(type == 'loss-agnostic',
+         alpha %ain% c(0.05, 0.5, 0.95)) |>
+  mutate(name = recode_values(name,
+                              'wgt_agn_kl_kl' ~ 'paste("KL/KL")',
+                              'wgt_agn_hd_hd' ~ 'paste("HD/HD")',
+                              'wgt_agn_kl_hd' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |>
+           fct_relevel('paste("KL/KL")', 'paste("HD/HD")')) |>
+  ggplot(aes(x = wgt)) +
+  geom_density(aes(y = after_stat(scaled),
+                   color = name,
+                   linetype = name,
+                   fill = name),
+               alpha = 0.2,
+               key_glyph = 'path',
+               linewidth = 0.5,
+               bounds = c(0, Inf)) +
+  facet_grid(cols = vars(alpha), labeller = label_bquote(cols = alpha == .(alpha)),
+             scales = "free_x") +
+  facetted_pos_scales(
+    x = list(
+      scale_x_continuous(limits = c(0.2, 1.31), expand = expansion(c(0, 0.01), c(0, 0))),
+      scale_x_continuous(limits = c(0, 5.9), expand = expansion(c(0, 0.01), c(0, 0))),
+      scale_x_continuous(limits = c(0, 10), expand = expansion(c(0, 0.01), c(0, 0)))
+    )
+  ) +
+  scale_color_manual(values = unname(COLORPAL[c('black', 'magenta', 'lightblue', 'green', 'blue')]),
+                     labels = scales::parse_format(),
+                     guide = br_wgt_gd) +
+  scale_fill_manual(values = unname(COLORPAL[c('black', 'magenta', 'lightblue', 'green', 'blue')]),
+                    labels = scales::parse_format(),
+                    guide = br_wgt_gd) +
+  scale_linetype_manual(values = c('solid', '22', '44', '11', '3111'),
+                        labels = scales::parse_format(),
+                        guide = br_wgt_gd) +
+  scale_y_continuous(expand = expansion(c(0, 0), c(0, 0.01))) +
+  plottheme() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  labs(x = "Normalized loss-agnostic bridge weight",
+       y = "Scaled density")
+```
+
+```{r}
+#| label: fminst-bridge-weights-adversarial-density
+#| fig-width: 6
+#| fig-height: 2
+br_weights |>
+  filter(type == 'loss-adversarial',
+         alpha %ain% c(0.05, 0.5, 0.95)) |>
+  mutate(model = str_replace(name, 'wgt_', 'nw_') |>
+           str_replace('_([klhd]{2})$', '\\1')) |>
+  inner_join(select(optim_adv, model, gamma, selected_nu), join_by(model, gamma)) |>
+  filter(abs(nu - selected_nu) < 1e-4) |>
+  mutate(name = recode_values(name,
+                              'wgt_adv_kl_kl' ~ 'paste("KL/KL")',
+                              'wgt_adv_hd_hd' ~ 'paste("HD/HD")',
+                              'wgt_adv_kl_hd' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |>
+           fct_relevel('paste("KL/KL")', 'paste("HD/HD")')) |>
+  ggplot(aes(x = wgt)) +
+  geom_density(aes(y = after_stat(scaled),
+                   color = name,
+                   linetype = name,
+                   fill = name),
+               alpha = 0.2,
+               key_glyph = 'path',
+               linewidth = 0.5,
+               bounds = c(0, Inf)) +
+  facet_grid(cols = vars(alpha), labeller = label_bquote(cols = alpha == .(alpha)),
+             scales = "free_x") +
+  facetted_pos_scales(
+    x = list(
+      scale_x_continuous(limits = c(0.7, 1.21), expand = expansion(c(0, 0.01), c(0, 0))),
+      scale_x_continuous(limits = c(0, 3), expand = expansion(c(0, 0.01), c(0, 0))),
+      scale_x_continuous(limits = c(0, 6), expand = expansion(c(0, 0.01), c(0, 0)))
+    )
+  ) +
+  scale_color_manual(values = unname(COLORPAL[c('black', 'magenta', 'lightblue', 'green', 'blue')]),
+                     labels = scales::parse_format(),
+                     guide = br_wgt_gd) +
+  scale_fill_manual(values = unname(COLORPAL[c('black', 'magenta', 'lightblue', 'green', 'blue')]),
+                    labels = scales::parse_format(),
+                    guide = br_wgt_gd) +
+  scale_linetype_manual(values = c('solid', '22', '44', '11', '3111'),
+                        labels = scales::parse_format(),
+                        guide = br_wgt_gd) +
+  scale_y_continuous(expand = expansion(c(0, 0), c(0, 0.01))) +
+  plottheme() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  labs(x = "Normalized loss-adversarial bridge weight",
+       y = "Scaled density")
+```
+

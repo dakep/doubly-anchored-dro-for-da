@@ -1,0 +1,220 @@
+---
+title: "Bridge Weights"
+date: last-modified
+format:
+  html:
+    embed-resources: true
+    
+---
+
+## Setup
+
+```{r}
+#| label: setup
+#| include: false
+#| echo: false
+library(tidyverse)
+library(gridExtra)
+library(ggpubr)
+library(lamW)
+source("plotting-utils.R")
+
+dev_pdf <- function (filename, width, height, .path = "figures") {
+  if (!dir.exists(.path)) {
+    dir.create(.path, mode = '0755', recursive = TRUE)
+  }
+  if (isTRUE(capabilities('cairo'))) {
+    cairo_pdf(file.path(.path, str_remove(basename(filename), coll("-1"))),
+              fallback_resolution = 600,
+              antialias = 'default',
+              width = width,
+              height = height)
+  } else {
+    pdf(file.path(.path, str_remove(basename(filename), coll("-1"))),
+        width = width,
+        height = height)
+  }
+}
+
+knitr::opts_chunk$set(fig.width  = 6,
+                      fig.height = 2,
+                      out.width  = "100%",
+                      dev        = c('png', 'dev_pdf'),
+                      fig.ext    = c('png', 'pdf'),
+                      echo       = FALSE,
+                      warning    = FALSE,
+                      error      = FALSE,
+                      message    = FALSE)
+```
+
+
+```{r}
+bridge_weights <- function (lr, type = c('klkl', 'hdhd', 'klhd'), alpha, gamma) {
+  switch(match.arg(type),
+         klkl = lr^alpha,
+         hdhd = ((1 - alpha) + alpha * sqrt(lr))^2,
+         klhd = {
+           beta <- (alpha / (1 - alpha)) * sqrt(lr)
+           b <- (beta / lambertW0(beta * exp(-gamma)))^2
+           if_else(alpha < .Machine$double.eps | lr < .Machine$double.eps, exp(2 * gamma), b)
+         }
+  )
+}
+
+settings <- list(
+  'paste("KL/KL")' = \(alpha) list(type = 'klkl', alpha = alpha),
+  'paste("HD/HD")' = \(alpha) list(type = 'hdhd', alpha = alpha),
+  'paste("KL/H", D[gamma==-2])' = \(alpha) list(type = 'klhd', alpha = alpha, gamma = -2),
+  'paste("KL/H", D[gamma==0])' = \(alpha) list(type = 'klhd', alpha = alpha, gamma =  0),
+  'paste("KL/H", D[gamma==+2])' = \(alpha) list(type = 'klhd', alpha = alpha, gamma = +2)
+)
+```
+
+## As a function of $\rho$
+
+```{r}
+#| label: bw-fun-of-rho
+alpha_seq <- c(0.01, seq(0.1, 0.9, by = 0.2), 0.99)
+lr <- seq(0, 5, length.out = 501)
+
+bws <- map_dfr(alpha_seq, \(a) {
+  bw <- vapply(settings, FUN.VALUE = lr, \(s) {
+    do.call(bridge_weights, c(list(lr = lr), s(a)))
+  })
+
+  tibble(alpha = a,
+         lrv   = rep(lr, times = length(settings)),
+         type = rep(names(settings), each = length(lr)),
+         value = as.numeric(bw))
+}) |>
+  mutate(type = fct_inorder(type),
+         alpha_str = sprintf("alpha%s%.2f", if_else(alpha > 1 - 1e-3, '%~~%', '=='), alpha) |>
+           fct_inorder())
+```
+
+```{r}
+#| label: bw-fun-of-rho-alphacol
+bws |>
+  filter(lrv > 0) |>
+  group_by(type, alpha) |>
+  mutate(value = value / value[[which.min(abs(lrv - 1))]]) |>
+  ungroup() |> 
+  ggplot(aes(x = lrv, y = value, color = alpha, group = factor(alpha))) +
+  geom_line(linewidth = 1) +
+  facet_grid(cols = vars(type), scales = 'free_y', labeller = 'label_parsed') +
+  scale_color_viridis_c(option = 'A', direction = -1,
+                        end = 0.8) +
+  plottheme(dark = F) +
+  labs(x = "Likelihood ratio",
+       y = "Bridge weight",
+       color = expression(alpha))
+```
+
+```{r}
+#| label: bw-fun-of-rho-typecol
+pl_by_rho <- bws |>
+  filter(lrv > 0) |>
+  group_by(type, alpha) |>
+  mutate(value = value / value[[which.min(abs(lrv - 1))]]) |>
+  ungroup() |> 
+  filter(alpha %in% c(0.1, 0.5, 0.9)) |>
+  ggplot(aes(x = lrv, y = value, color = type)) +
+  geom_line(aes(linetype = type), linewidth = 0.8) +
+  facet_grid(cols = vars(alpha_str), scales = 'free_y', labeller = 'label_parsed') +
+  scale_color_manual(values = unname(COLORPAL[c('black', 'orange', 'lightblue', 'green', 'blue')]),
+                     labels = scales::parse_format()) +
+  scale_linetype_manual(values = c('solid', '22', '41', '11', '3111'),
+                        labels = scales::parse_format()) +
+  scale_y_continuous(expand = expansion(0)) +
+  coord_cartesian(ylim = c(0, 3.1)) +
+  plottheme() +
+  labs(x = "Likelihood ratio",
+       y = "Bridge weight",
+       color = NULL,
+       linetype = NULL)
+pl_by_rho
+```
+
+
+## As a function of $\alpha$
+
+```{r}
+#| label: bw-fun-of-alpha
+alphas <- seq(0, 1, length.out = 501)
+lr_seq <- c(0.1, seq(0, 5, length.out = 21))
+
+bws_alpha <- map_dfr(lr_seq, \(lr) {
+  a0 <- which.min(abs(alphas))
+  bw <- vapply(settings, FUN.VALUE = alphas, \(s) {
+    x <- do.call(bridge_weights, c(list(lr = lr), s(alphas)))
+    x / x[[a0]]
+  })
+
+  tibble(alpha = rep(alphas, times = length(settings)),
+         lr    = lr,
+         type  = rep(names(settings), each = length(alphas)),
+         value = as.numeric(bw))
+}) |>
+  mutate(type = fct_inorder(type),
+         lr_str = sprintf("rho==%.1f", lr) |>
+           fct_inorder())
+```
+
+
+```{r}
+#| label: bw-fun-of-alpha-lrcol
+#| fig-height: 3.3
+bws_alpha |>
+  filter(lr > 0) |>
+  group_by(type, alpha) |>
+  mutate(value_norm = value / value[[which.min(abs(lr - 1))]],
+         value = log(value),
+         value = if_else(value > 6, NA_real_, value)) |>
+  ungroup() |>
+  pivot_longer(cols = c(value, value_norm), names_to = "normalized", values_to = "bw") |>
+  mutate(normalized = fct_recode(normalized, "Unnormalized (log)" = "value", "Normalized" = "value_norm")) |>
+  ggplot(aes(x = alpha, y = bw, color = lr, group = lr_str)) +
+  geom_line(linewidth = 1) +
+  facet_grid(cols = vars(type), rows = vars(normalized), scales = 'free_y',
+             labeller = 'label_parsed') +
+  scale_color_viridis_c(option = 'A', end = 0.8) +
+  scale_x_continuous(breaks = c(0, 0.5, 1),
+                     labels = c('0', '0.5', '1')) +
+  plottheme() +
+  labs(x = expression(alpha),
+       y = "Bridge weight",
+       color = expression(rho))
+```
+
+```{r}
+#| label: bw-fun-of-alpha-typecol
+pl_by_alpha <- bws_alpha |>
+  group_by(type, alpha) |>
+  mutate(value = value / value[[which.min(abs(lr - 1))]]) |>
+  ungroup() |>
+  filter(lr %in% c(0.1, 0.5, 2, 4)) |>
+  ggplot(aes(x = alpha, y = value, color = type)) +
+  geom_line(aes(linetype = type), linewidth = 0.8) +
+  facet_grid(cols = vars(lr_str), labeller = 'label_parsed') +
+  scale_color_manual(values = unname(COLORPAL[c('black', 'orange', 'lightblue', 'green', 'blue')]),
+                     labels = scales::parse_format()) +
+  scale_linetype_manual(values = c('solid', '22', '41', '11', '3111'),
+                        labels = scales::parse_format()) +
+  scale_x_continuous(breaks = c(0, 0.5, 1),
+                     labels = c('0', '0.5', '1')) +
+  scale_y_continuous(expand = expansion(0)) +
+  coord_cartesian(ylim = c(0, 3.1)) +
+  plottheme() +
+  labs(x = expression(alpha),
+       y = "Bridge weight",
+       color = NULL,
+       linetype = NULL)
+pl_by_alpha
+```
+
+```{r}
+#| label: bridge-weights-bygeom
+#| fig-height: 4
+ggpubr::ggarrange(pl_by_rho, pl_by_alpha, ncol = 1, common.legend = TRUE, legend = 'right')
+```
+
