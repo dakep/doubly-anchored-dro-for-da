@@ -1,6 +1,7 @@
 import argparse
 
 import os
+from pathlib import Path
 import sys
 import multiprocessing as mp
 import numpy as np
@@ -92,14 +93,15 @@ def _positive_int(value: str) -> int:
     raise argparse.ArgumentTypeError("argument must be a positive integer")
   return parsed
 
-def evaluate(name, y_true, y_prob, alpha: float=float('nan'), gamma: float=float('nan'), nu: float=float('nan')):
+def evaluate(name: str, y_true: np.ndarray, y_prob: np.ndarray,
+             alpha: float=float('nan'), gamma: float=float('nan'), nu: float=float('nan'),
+             n_capped: int=0) -> dict:
     acc = accuracy_score(y_true, (y_prob >= 0.5).astype(int))
     auc = roc_auc_score(y_true, y_prob)
     brier = brier_score_loss(y_true, y_prob)
     f1 = f1_score(y_true, (y_prob >= 0.5).astype(int))
     return {"model": name, "accuracy": acc, "auc": auc, "brier": brier, "f1": f1,
-            "alpha": alpha, "gamma": gamma, "nu": nu}
-    # print(f"{name:<25} | Accuracy: {acc:.4f} | Brier Score: {brier:.4f}")
+            "n_capped": n_capped, "alpha": alpha, "gamma": gamma, "nu": nu}
 
 def append_result_row(out_fname: str, row: dict) -> None:
   pd.DataFrame([row]).to_csv(
@@ -120,7 +122,7 @@ def main() -> None:
   parser.add_argument("--start_replication", "-s", type=_positive_int, default=1)
   parser.add_argument("--force_overwrite", '-f', action="store_true")
   parser.add_argument("--output_suffix", type=str, default="")
-  parser.add_argument("--output_path", type=str, default="results")
+  parser.add_argument("--output-dir", type=Path, default=Path("results"))
   parser.add_argument("autoencoder", type=str)
   parser.add_argument("ae_dim", type=_positive_int)
   parser.add_argument("noise_type", choices=["laplace", "gaussian"])
@@ -135,7 +137,10 @@ def main() -> None:
   # Load the Fashion MNIST data for the specified classes
   fmnist_data = load_fmnist(args.class_A, args.class_B)
 
-  out_fname = f"{args.output_path}/results_{args.class_A}_{args.class_B}_aedim{args.ae_dim}_{args.noise_type}_sd{args.noise_sd}_bw{args.nw_bw:0.2f}_kern{args.nw_kernel}_{args.output_suffix}.csv"
+  args.output_dir.mkdir(parents=True, exist_ok=True)
+
+  out_fname = args.output_dir / \
+    f"results_{args.class_A}_{args.class_B}_aedim{args.ae_dim}_{args.noise_type}_sd{args.noise_sd}_bw{args.nw_bw:0.2f}_kern{args.nw_kernel}_{args.output_suffix}.csv"
 
   if os.path.isfile(out_fname):
     if args.force_overwrite:
@@ -154,7 +159,8 @@ def main() -> None:
       f"Accuracy={row['accuracy']:.4f} | "
       f"Brier score={row['brier']:.4f} | "
       f"AUC-ROC={row['auc']:.4f} | "
-      f"F1 Score={row['f1']:.4f}"
+      f"F1 Score={row['f1']:.4f} | "
+      f"# capped={row['n_capped']} "
     )
 
   with torch.no_grad():
@@ -246,51 +252,54 @@ def main() -> None:
 
     for alpha in alpha_range:
       print(f"\nCalculating bridged NW weights for alpha={alpha:.2f}...")
-      w_klkl = get_bridge_weights(lr_kde, geometry='kl_kl', alpha=alpha)
-      w_hdhd = get_bridge_weights(lr_kde, geometry='hd_hd', alpha=alpha)
+      w_klkl, n_capped_klkl = get_bridge_weights(lr_kde, geometry='kl_kl', alpha=alpha)
+      w_hdhd, n_capped_hdhd = get_bridge_weights(lr_kde, geometry='hd_hd', alpha=alpha)
 
       prob_nw_klkl = nw_test.predict(y_S, w_klkl)
-      record_result(result_meta | evaluate("nw_klkl", y_T, prob_nw_klkl, alpha))
+      record_result(result_meta | evaluate("nw_klkl", y_T, prob_nw_klkl, alpha, n_capped=n_capped_klkl))
       prob_nw_hdhd = nw_test.predict(y_S, w_hdhd)
-      record_result(result_meta | evaluate("nw_hdhd", y_T, prob_nw_hdhd, alpha))
+      record_result(result_meta | evaluate("nw_hdhd", y_T, prob_nw_hdhd, alpha, n_capped=n_capped_hdhd))
 
       if alpha < 1.0:
         for gamma in gamma_range:
           print(f"\nCalculating bridged KL/HD NW weights for alpha={alpha:.2f} and gamma={gamma:.2f}...")
-          w_klhd = get_bridge_weights(lr_kde, geometry='kl_hd', alpha=alpha, gamma=gamma)
+          w_klhd, n_capped_klhd = get_bridge_weights(lr_kde, geometry='kl_hd', alpha=alpha, gamma=gamma)
           prob_nw_klhd = nw_test.predict(y_S, w_klhd)
-          record_result(result_meta | evaluate("nw_klhd", y_T, prob_nw_klhd, alpha, gamma))
+          record_result(result_meta | evaluate("nw_klhd", y_T, prob_nw_klhd, alpha, gamma, n_capped=n_capped_klhd))
 
       # Loss-adversarial KL/KL NW models
       for nu in nu_range_klkl:
         print(f"\nCalculating loss-adversarial KL/KL NW weights for alpha={alpha:.2f} and nu={nu:.2f}...")
-        prob_nw_adv_klkl, _ = fit_loss_adversarial_nw(nw_train, nw_test,
-                                                      y_S, lr_kde,
-                                                      geometry='kl_kl',
-                                                      loss='cross_entropy',
-                                                      alpha=alpha,
-                                                      nu=nu,
-                                                      max_iter=_ADV_MAX_ITER,
-                                                      iter_conv_tol=_ADV_ITER_CONV_TOL,
-                                                      step_size=_ADV_STEP_SIZE)
-        record_result(result_meta | evaluate("nw_adv_klkl", y_T, prob_nw_adv_klkl, alpha, nu=nu))
+        prob, _, n_capped = fit_loss_adversarial_nw(
+          nw_train, nw_test,
+          y_S, lr_kde,
+          geometry='kl_kl',
+          loss='cross_entropy',
+          alpha=alpha,
+          nu=nu,
+          max_iter=_ADV_MAX_ITER,
+          iter_conv_tol=_ADV_ITER_CONV_TOL,
+          step_size=_ADV_STEP_SIZE)
+        record_result(result_meta | evaluate("nw_adv_klkl", y_T, prob, alpha, nu=nu, n_capped=n_capped))
 
       # Loss-adversarial HD/HD NW models
       for nu in nu_range_hdhd:
         print(f"\nCalculating loss-adversarial HD/HD NW weights for alpha={alpha:.2f} and nu={nu:.2f}...")
         try:
-          prob_nw_adv_hdhd, _ = fit_loss_adversarial_nw(nw_train, nw_test,
-                                                        y_S, lr_kde,
-                                                        geometry='hd_hd',
-                                                        loss='cross_entropy',
-                                                        alpha=alpha,
-                                                        nu=nu,
-                                                        max_iter=_ADV_MAX_ITER,
-                                                        iter_conv_tol=_ADV_ITER_CONV_TOL,
-                                                        step_size=_ADV_STEP_SIZE)
-          record_result(result_meta | evaluate("nw_adv_hdhd", y_T, prob_nw_adv_hdhd, alpha, nu=nu))
+          prob, _, n_capped = fit_loss_adversarial_nw(
+            nw_train, nw_test,
+            y_S, lr_kde,
+            geometry='hd_hd',
+            loss='cross_entropy',
+            alpha=alpha,
+            nu=nu,
+            max_iter=_ADV_MAX_ITER,
+            iter_conv_tol=_ADV_ITER_CONV_TOL,
+            step_size=_ADV_STEP_SIZE)
+          record_result(result_meta | evaluate("nw_adv_hdhd", y_T, prob, alpha, nu=nu, n_capped=n_capped))
         except ValueError as e:
-          print(f"Skipping loss-adversarial HD/HD NW for alpha={alpha:.2f} and nu={nu:.2f} due to error: {e}", file=sys.stderr, flush=True)
+          print(f"Skipping loss-adversarial HD/HD NW for alpha={alpha:.2f} and nu={nu:.2f} due to error: {e}",
+                file=sys.stderr, flush=True)
           continue
 
       if alpha < 1.0:
@@ -298,17 +307,18 @@ def main() -> None:
         for nu in nu_range_klhd:
           for gamma in gamma_range:
             print(f"\nCalculating loss-adversarial KL/HD NW weights for alpha={alpha:.2f}, gamma={gamma:.2f}, nu={nu:.2f}...")
-            prob_nw_adv_klhd, _ = fit_loss_adversarial_nw(nw_train, nw_test,
-                                                          y_S, lr_kde,
-                                                          geometry='kl_hd',
-                                                          loss='cross_entropy',
-                                                          alpha=alpha,
-                                                          gamma=gamma,
-                                                          nu=nu,
-                                                          max_iter=_ADV_MAX_ITER,
-                                                          iter_conv_tol=_ADV_ITER_CONV_TOL,
-                                                          step_size=_ADV_STEP_SIZE)
-            record_result(result_meta | evaluate("nw_adv_klhd", y_T, prob_nw_adv_klhd, alpha, gamma, nu))
+            prob, _, n_capped = fit_loss_adversarial_nw(
+              nw_train, nw_test,
+              y_S, lr_kde,
+              geometry='kl_hd',
+              loss='cross_entropy',
+              alpha=alpha,
+              gamma=gamma,
+              nu=nu,
+              max_iter=_ADV_MAX_ITER,
+              iter_conv_tol=_ADV_ITER_CONV_TOL,
+              step_size=_ADV_STEP_SIZE)
+            record_result(result_meta | evaluate("nw_adv_klhd", y_T, prob, alpha, gamma, nu, n_capped=n_capped))
 
 if __name__ == "__main__":
   main()

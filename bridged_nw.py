@@ -1,11 +1,26 @@
 import numpy as np
-from scipy.stats import gaussian_kde
-from scipy.special import lambertw
+from scipy.stats import gaussian_kde, log
+from scipy.special import wrightomega
 from sklearn.metrics.pairwise import rbf_kernel, pairwise_distances
 import torch
 
-def estimate_likelihood_ratio(X_source, X_target, X_eval, clip=(1e-8, 1e8), bw_method='silverman'):
-    """Estimates LR(x) = p_T(x) / p_S(x) using Gaussian KDE."""
+class EstimatedLikelihoodRatio:
+  """Class for estimating likelihood ratios using Gaussian KDE."""
+
+  def __init__(self, lr: np.ndarray, log: bool, method: str):
+    self.lr = lr
+    self.log = log
+    self.method = method
+
+  def val(self, log: bool = False) -> np.ndarray:
+    """Returns the estimated likelihood ratio or its log."""
+    if log:
+      return np.log(self.lr) if not self.log else self.lr
+    else:
+      return self.lr if not self.log else np.exp(self.lr)
+
+def estimate_likelihood_ratio(X_source: np.ndarray, X_target: np.ndarray, X_eval: np.ndarray, log: bool = True, bw_method: str|None='silverman'):
+    """Estimates LR(x) = p_T(x) / p_S(x) or the log of that using Gaussian KDE."""
     # Transpose for scipy gaussian_kde (expects dims x samples)
     kde_S = gaussian_kde(X_source.T, bw_method=bw_method)
     kde_T = gaussian_kde(X_target.T, bw_method=bw_method)
@@ -13,8 +28,12 @@ def estimate_likelihood_ratio(X_source, X_target, X_eval, clip=(1e-8, 1e8), bw_m
     p_S = kde_S(X_eval.T)
     p_T = kde_T(X_eval.T)
 
-    # Clip to prevent division by zero or exploding ratios
-    lr = np.clip(p_T / p_S, clip[0], clip[1])
+    if log:
+      lr = EstimatedLikelihoodRatio(np.log(p_T) - np.log(p_S), log=True,
+                                    method=f'gaussian KDE with bandwidth {bw_method}')
+    else:
+      lr = EstimatedLikelihoodRatio(p_T / p_S, log=False,
+                                    method=f'gaussian KDE with bandwidth {bw_method}')
     return lr
 
 class WeightedNadarayaWatson:
@@ -66,15 +85,14 @@ class WeightedNadarayaWatson:
     return np.clip(numerator / denominator, apply_clip[0], apply_clip[1]) if apply_clip is not None else \
       (numerator / denominator)
 
-def get_loss_adversarial_weights(lr, losses: np.ndarray|None=None, geometry='kl_kl', alpha: float|None=None,
-                                 gamma: float|None=None, nu: float|None=None, num_tol: float=1e-8) -> np.ndarray:
+def get_loss_adversarial_weights(lr: EstimatedLikelihoodRatio, geometry: str, losses: np.ndarray|None=None,
+                                 alpha: float|None=None, gamma: float=0.0, nu: float|None=None,
+                                 num_tol: float=1e-8) -> tuple[np.ndarray, int]:
   """
   Computes the loss-adversarial weights dynamically incorporating empirical risk.
   """
   if alpha is None:
     raise ValueError("alpha must be provided.")
-  elif geometry == 'kl_hd' and gamma is None:
-    raise ValueError("gamma must be provided for 'kl_hd' geometry")
 
   ignore_losses = False
   if losses is None:
@@ -88,7 +106,9 @@ def get_loss_adversarial_weights(lr, losses: np.ndarray|None=None, geometry='kl_
 
   if geometry == 'kl_kl':
     # Exponential tilting + geometric bridge
-    log_wgts = losses / nu + alpha * np.log(lr)
+    log_lr = lr.val(log=True)
+    lr_component = np.zeros_like(log_lr) if alpha == 0 else alpha * log_lr
+    log_wgts = losses / nu + lr_component
 
   elif geometry == 'hd_hd':
     # Rational tilting + square-root stabilization
@@ -101,35 +121,49 @@ def get_loss_adversarial_weights(lr, losses: np.ndarray|None=None, geometry='kl_
         print(f"WARNING: nu must be greater than the maximum loss ({max_loss:.4f}) for 'hd_hd' geometry. Adjusting nu to {max_loss + 1e-4:.4f}.")
         raise ValueError(f"nu must be greater than the maximum loss ({max_loss:.4f}) for 'hd_hd' geometry.")
 
-    log_wgts = 2 * (np.log(((1 - alpha) + alpha * np.sqrt(lr))) - np.log(nu - losses))
+    log_lr = lr.val(log=True)
+    if alpha == 0:
+      log_mixture = np.zeros_like(log_lr)
+    elif alpha == 1:
+      log_mixture = 0.5 * log_lr
+    else:
+      log_mixture = np.logaddexp(np.log1p(-alpha), np.log(alpha) + 0.5 * log_lr)
+    log_wgts = 2 * (log_mixture - np.log(nu - losses))
 
   elif geometry == 'kl_hd':
     # Lambert-W tilting + asymmetric stabilization
     # beta = (alpha / (1 - alpha)) * np.sqrt(lr)
     # A_h = np.clip((losses + gamma) / nu, -20, 20)
     # arg = beta * np.exp(-A_h)
-    beta_log = np.log(alpha) - np.log(1 - alpha) + 0.5 * np.log(lr)
+    beta_log = np.log(alpha) - np.log(1 - alpha) + 0.5 * lr.val(log=True)
     A_h_beta_log = beta_log - (losses + gamma) / nu
-    W_val = np.real(lambertw(np.exp(A_h_beta_log)))
-    W_val_positive = W_val > 0
-    W_val[W_val_positive > 0] = np.log(W_val[W_val_positive > 0])
-    W_val[~W_val_positive] = -np.inf
+    with np.errstate(divide='ignore'):
+      W_val = np.log(np.real(wrightomega(A_h_beta_log)))
+    underflow = np.isneginf(W_val) & np.isfinite(A_h_beta_log)
+    W_val[underflow] = A_h_beta_log[underflow]
 
-    log_wgts = 2 * (beta_log - W_val)
-    log_wgts[np.isinf(beta_log) & np.isneginf(W_val)] = 0
+    log_wgts = np.empty_like(beta_log)
+    positive_infinite = np.isposinf(beta_log)
+    negative_infinite_pair = np.isneginf(beta_log) & np.isneginf(W_val)
+    log_wgts[positive_infinite] = np.inf
+    log_wgts[negative_infinite_pair] = 0
+    finite_pair = ~(positive_infinite | negative_infinite_pair)
+    log_wgts[finite_pair] = 2 * (beta_log[finite_pair] - W_val[finite_pair])
   else:
     raise ValueError("Geometry must be 'kl_kl', 'hd_hd', or 'kl_hd'")
 
+  nr_capped_weights = np.sum(log_wgts > -num_tol_log)
   log_wgts = np.clip(log_wgts, None, -num_tol_log)
   # Normalize weights to sum to N (maintains stability in the NW denominator)
   norm_log_wgts = log_wgts + np.log(len(log_wgts)) - np.log(np.sum(np.exp(log_wgts)))
-  return np.exp(norm_log_wgts)
+  return np.exp(norm_log_wgts), nr_capped_weights
 
-def get_bridge_weights(lr, geometry: str='kl_kl', alpha: float|None=None, gamma: float|None=None):
+def get_bridge_weights(lr: EstimatedLikelihoodRatio, geometry: str='kl_kl', alpha: float|None=None,
+                       gamma: float|None=None) -> tuple[np.ndarray, int]:
     return get_loss_adversarial_weights(lr, losses=None, geometry=geometry, alpha=alpha, gamma=gamma)
 
 def fit_loss_adversarial_nw(nw_train: WeightedNadarayaWatson, nw_test: WeightedNadarayaWatson,
-                            y_train: torch.Tensor, lr_train: float,
+                            y_train: torch.Tensor, lr_train: EstimatedLikelihoodRatio,
                             loss: str='mse', geometry: str='kl_kl', nu: float|None=None,
                             max_iter: int=5, iter_conv_tol: float=1e-4, step_size: float=0.5, min_step_size: float=1e-6,
                             **kwargs) -> tuple[np.ndarray, np.ndarray]:
@@ -139,10 +173,8 @@ def fit_loss_adversarial_nw(nw_train: WeightedNadarayaWatson, nw_test: WeightedN
   """
   if loss == 'mse':
     loss_fn = lambda y_true, y_pred: (y_true - y_pred) ** 2
-    max_loss_val = 1.
   elif loss == 'mae':
     loss_fn = lambda y_true, y_pred: np.abs(y_true - y_pred)
-    max_loss_val = 1.
   elif loss == 'cross_entropy':
     loss_fn = lambda y_true, y_pred: np.clip(-(y_true * np.log(y_pred + 1e-8) +
                                                (1 - y_true) * np.log(1 - y_pred + 1e-8)),
@@ -151,7 +183,7 @@ def fit_loss_adversarial_nw(nw_train: WeightedNadarayaWatson, nw_test: WeightedN
     raise ValueError("Loss must be 'mse', 'mae', or 'cross_entropy'.")
 
   # 1. Initialize with pure density-bridge weights (structural baseline, no loss tilt)
-  w_current = get_bridge_weights(lr_train, geometry=geometry, **kwargs)
+  w_current, n_capped = get_bridge_weights(lr_train, geometry=geometry, **kwargs)
   w_current = w_current * (len(w_current) / np.sum(w_current))
   w_prev_2step = w_current.copy()  # For cycle detection
 
@@ -168,7 +200,7 @@ def fit_loss_adversarial_nw(nw_train: WeightedNadarayaWatson, nw_test: WeightedN
 
     # Step C: Update adversarial weights incorporating the new loss landscape
     try:
-      w_adv = get_loss_adversarial_weights(lr_train, conditional_risk, geometry=geometry, nu=nu, **kwargs)
+      w_adv, n_capped = get_loss_adversarial_weights(lr_train, losses=conditional_risk, geometry=geometry, nu=nu, **kwargs)
     except ValueError as e:
       print(f"Error in calculating adversarial weights: {e}")
       raise e
@@ -198,4 +230,4 @@ def fit_loss_adversarial_nw(nw_train: WeightedNadarayaWatson, nw_test: WeightedN
   # 3. New prediction on the target domain using the updated adversarial weights
   y_pred_target = nw_test.predict(y_train, w_current)
 
-  return y_pred_target, w_current
+  return y_pred_target, w_current, n_capped

@@ -1,0 +1,359 @@
+---
+title: "Bounded-Overlap Simulation"
+date: last-modified
+params:
+  output_dir: "results/simulation-design"
+format:
+  html:
+    embed-resources: true
+---
+
+## Population summary
+
+```{r}
+#| label: setup
+#| include: false
+#| echo: false
+library(tidyverse)
+library(cowplot)
+library(knitr)
+library(kableExtra)
+source("plotting-utils.R")
+
+EPSILON <- 0.50
+LABEL_SHIFT <- -0.05
+N_THETA <- 201
+N_ALPHA <- 51
+
+output_dir <- file.path("sim-results")
+replication_file <- file.path(output_dir, sprintf("simulation_replications_eps%.2f_c%.2f.csv", EPSILON, LABEL_SHIFT))
+summary_file <- file.path(output_dir, sprintf("simulation_summary_eps%.2f_c%.2f.csv", EPSILON, LABEL_SHIFT))
+if (!file.exists(replication_file) || !file.exists(summary_file)) {
+  stop("Simulation CSVs not found. Run simulation_design.py first or set output_dir.")
+}
+
+dev_pdf <- function (filename, width, height, .path = "figures") {
+  if (!dir.exists(.path)) {
+    dir.create(.path, mode = '0755', recursive = TRUE)
+  }
+  if (isTRUE(capabilities('cairo'))) {
+    cairo_pdf(file.path(.path, str_remove(basename(filename), coll("-1"))),
+              fallback_resolution = 600,
+              antialias = 'default',
+              width = width,
+              height = height)
+  } else {
+    pdf(file.path(.path, str_remove(basename(filename), coll("-1"))),
+        width = width,
+        height = height)
+  }
+}
+
+knitr::opts_chunk$set(fig.width  = 6,
+                      fig.height = 2,
+                      out.width  = "100%",
+                      dev        = c('png', 'dev_pdf'),
+                      fig.ext    = c('png', 'pdf'),
+                      echo       = FALSE,
+                      warning    = FALSE,
+                      error      = FALSE,
+                      message    = FALSE)
+```
+
+```{r}
+#| label: load-data
+replications <- read_csv(replication_file, show_col_types = FALSE) |> 
+  mutate(geometry = factor(geometry, levels = c("kl_kl", "hd_hd"), labels = c("KL/KL", "HD/HD")))
+
+population_summary <- read_csv(summary_file, show_col_types = FALSE) |> 
+  mutate(geometry = factor(geometry, levels = c("kl_kl", "hd_hd"), labels = c("KL/KL", "HD/HD")))
+
+alpha_values <- sort(unique(replications$alpha))
+design <- population_summary |>
+  distinct(epsilon, label_shift, delta, sample_size, target_sample_size)
+if (nrow(design) != 1) {
+  stop("Expected one fixed simulation design in the summary CSV.")
+}
+
+ratio_range <- (1 + design$epsilon) / (1 - design$epsilon)
+hellinger_covariate <- 2 - 2 * ((1 + design$epsilon)^(3 / 2) - (1 - design$epsilon)^(3 / 2)) / (3 * design$epsilon)
+log_moment <- function (alpha, epsilon) {
+  lower <- 1 - design$epsilon
+  upper <- 1 + design$epsilon
+  power <- alpha + 1
+  log((upper^power - lower^power) / (2 * design$epsilon * power))
+}
+
+radius_curves <- crossing(
+  geometry = unique(population_summary$geometry),
+  alpha = alpha_values
+) |>
+  left_join(population_summary, join_by(geometry)) |>
+  mutate(
+    lower_ratio = 1 - epsilon,
+    upper_ratio = 1 + epsilon,
+    ratio_range = upper_ratio / lower_ratio,
+    hellinger_covariate = 2 - 2 * (upper_ratio^(3 / 2) - lower_ratio^(3 / 2)) / (3 * epsilon),
+    power = alpha + 1,
+    log_moment = log_moment(alpha, epsilon),
+    derivative = (upper_ratio^power * log(upper_ratio) - lower_ratio^power * log(lower_ratio)) /
+      (upper_ratio^power - lower_ratio^power) - 1 / power,
+    normalizer = 1 - alpha * (1 - alpha) * hellinger_covariate,
+    source_radius = if_else(
+      geometry == "KL/KL",
+      pmax(alpha * derivative - log_moment, 0),
+      pmax(2 - (2 - alpha * hellinger_covariate) / sqrt(normalizer), 0)
+    ),
+    target_radius = if_else(
+      geometry == "KL/KL",
+      pmax((alpha - 1) * derivative - log_moment, 0),
+      pmax(2 - (2 - (1 - alpha) * hellinger_covariate) / sqrt(normalizer), 0)
+    ),
+    kappa = log(80 * N_ALPHA * N_THETA / delta),
+    lambda_n = 2 * sqrt(18 * kappa / (sample_size - 1)) + 30 * kappa / (sample_size - 1),
+    sensitivity = if_else(
+      geometry == "KL/KL",
+      ratio_range^alpha,
+      ((1 - alpha + alpha * sqrt(upper_ratio)) /
+        (1 - alpha + alpha * sqrt(lower_ratio)))^2
+    ),
+    risk_envelope = if_else(
+      geometry == "KL/KL",
+      2 * sqrt(target_radius / 2) + 2 * sqrt(delta_target_label / 2) + 2 * sensitivity * lambda_n,
+      2 * sqrt(target_radius) + 2 * sqrt(delta_target_label) + 2 * sensitivity * lambda_n
+    ),
+    population_ess = if_else(
+      geometry == "KL/KL",
+      exp(2 * log_moment - log_moment(2 * alpha, epsilon)),
+      NA_real_
+    ),
+    population_ess = {
+      # First for hd/hd
+      delta_h <- 2 - 2 * (upper_ratio^(3 / 2) - lower_ratio^(3 / 2)) / (3 * epsilon)
+      normalizer <- 1 - alpha * (1 - alpha) * delta_h
+      second_moment <- map2_dbl(alpha, epsilon, \(a, e) {
+        integrate(
+          \(x) (1 - a + a * sqrt(1 + e * (2 * x - 1)))^4,
+          lower = 0,
+          upper = 1,
+          rel.tol = 1e-11
+        )$value
+      })
+      normalizer^2 / second_moment
+    },
+    population_ess = if_else(geometry == 'KL/KL',
+                             exp(2 * log_moment - log_moment(2 * alpha, epsilon)),
+                             population_ess))
+
+risk_summary <- replications |>
+  group_by(geometry, alpha) |>
+  summarize(
+    mean_excess_risk = mean(target_excess_risk),
+    q10 = quantile(target_excess_risk, 0.10),
+    q90 = quantile(target_excess_risk, 0.90),
+    mean_ess = mean(ess_fraction),
+    .groups = "drop"
+  )
+
+risk_curves <- risk_summary |>
+  left_join(
+    select(radius_curves, geometry, alpha, risk_envelope, population_ess),
+    join_by(geometry, alpha)
+  )
+
+radius_long <- radius_curves |>
+  select(geometry, alpha, source_radius, target_radius) |>
+  pivot_longer(
+    cols = c(source_radius, target_radius),
+    names_to = "radius_type",
+    values_to = "radius"
+  ) |>
+  mutate(radius_type = recode(radius_type,
+                              source_radius = "Source radius",
+                              target_radius = "Target radius"))
+
+min_target_excess_risk <- risk_curves |> 
+  group_by(geometry) |> 
+  filter(mean_excess_risk < min(mean_excess_risk) + .Machine$double.eps) |> 
+  ungroup()
+
+risk_envelope_scale <- with(risk_curves, max(q90, na.rm = TRUE) / max(risk_envelope, na.rm = TRUE))
+```
+
+```{r}
+#| label: simulation-summary-table
+#| tbl-cap: "Population quantities and selected bridge parameters."
+population_summary |>
+  select(
+    geometry,
+    delta_target_label,
+    rho_source,
+    rho_target,
+    alpha_lower,
+    alpha_min_mean_excess_risk,
+    alpha_min_risk_envelope,
+    endpoint_slope_margin
+  ) |> 
+  mutate(covariate_shift_epsilon = EPSILON,
+         label_shift_c = LABEL_SHIFT) |> 
+  left_join(min_target_excess_risk |> 
+              select(geometry, mean_excess_risk, mean_ess, risk_envelope, population_ess),
+            join_by(geometry)) |> 
+  select(geometry, covariate_shift_epsilon, label_shift_c, everything()) |> 
+  pivot_longer(cols = -geometry, names_to = "parameter", values_to = "value") |> 
+  pivot_wider(names_from = geometry, values_from = value) |> 
+  mutate(parameter = recode_values(
+    parameter,
+    "covariate_shift_epsilon" ~ "Covariate shift (𝜀)",
+    "label_shift_c" ~ "Label shift (c)",
+    "delta_target_label" ~ "Target label radius",
+    "rho_source" ~ "Source radius",
+    "rho_target" ~ "Target radius",
+    "alpha_lower" ~ "Admissible lower alpha",
+    "alpha_min_mean_excess_risk" ~ "Risk-minimizing alpha",
+    "alpha_min_risk_envelope" ~ "Envelope-minimizing alpha",
+    "endpoint_slope_margin" ~ "Endpoint-slope margin",
+    "mean_excess_risk" ~ "Mean target excess risk at risk-minimizing alpha",
+    "mean_ess" ~ "Mean ESS fraction at risk-minimizing alpha",
+    "risk_envelope" ~ "Risk-bound envelope at risk-minimizing alpha",
+    "population_ess" ~ "Population ESS fraction at risk-minimizing alpha")) |> 
+  kbl(align = 'lrr') |> 
+  kable_styling()
+```
+
+## Simulation profiles
+
+```{r}
+#| label: bounded-overlap-simulation-plot
+#| fig-width: 6
+#| fig-height: 5
+#| fig-cap: >
+#|  Exact radius profiles (top), realized target excess risk (middle) and effective sample size (bottom)
+#|  for the KL/KL and HD/HD bridges. The risk-bound envelope uses the right-hand scale.
+#|  The shaded interval in the radius profile plot denotes the admissible bridge range.
+#|  Dashed horizontal lines in the radius row mark the true source and target radii and
+#|  the dotted vertical lines mark the lower admissible endpoint.
+#|  The shaded regions in the risk panels show the 10th and 90th percentiles of the Monte Carlo risk.
+radius_plot <- population_summary |> 
+  ggplot() +
+  geom_rect(
+    aes(xmin = alpha_lower, xmax = alpha_upper, ymin = -Inf, ymax = Inf),
+    fill = COLORPAL[["green"]],
+    alpha = 0.1
+  ) +
+  geom_text(data = tibble(geometry = unique(population_summary$geometry),
+                          alpha = c(0.5, 0.51),
+                          radius = c(0.043, 0.03),
+                          label = "Admissible bridge range"),
+            aes(x = alpha, y = radius, label = label),
+            hjust = 0,
+            size = 2.8,
+            color = COLORPAL[["green"]]
+  ) +
+  geom_line(
+    data = radius_long,
+    aes(x = alpha, y = radius, color = radius_type),
+    linewidth = 0.7
+  ) +
+  geom_hline(
+    aes(yintercept = rho_source),
+    color = COLORPAL[["blue"]],
+    linetype = "dashed",
+    linewidth = 0.45
+  ) +
+  geom_hline(
+    aes(yintercept = rho_target),
+    color = COLORPAL[["orange"]],
+    linetype = "dashed",
+    linewidth = 0.45
+  ) +
+  geom_vline(
+    aes(xintercept = alpha_lower),
+    color = COLORPAL[["green"]],
+    linetype = "11",
+    linewidth = 0.5
+  ) +
+  facet_wrap(vars(geometry), nrow = 1) +
+  scale_color_manual(values = c(
+    "Source radius" = COLORPAL[["blue"]],
+    "Target radius" = COLORPAL[["orange"]]
+  )) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.2), expand = expansion(),
+                     labels = c("0", "0.2", "0.4", "0.6", "0.8", "1")) +
+  labs(x = NULL, y = "Radius", color = NULL) +
+  plottheme() +
+  theme(legend.position = "inside",
+        legend.position.inside = c(0.115, 0.80),
+        legend.margin = margin(0, 6, 0, 1),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.background = element_rect(fill = "white", color = 'gray20', linewidth = 0.3))
+
+risk_plot <- risk_curves |> 
+  ggplot(aes(alpha, mean_excess_risk)) +
+  geom_ribbon(aes(ymin = q10, ymax = q90, ), fill = COLORPAL[["magenta"]], alpha = 0.18) +
+  geom_line(aes(color = "Avg. target excess risk", linetype = "Avg. target excess risk"),
+            linewidth = 0.7) +
+  geom_line(
+    aes(y = risk_envelope * risk_envelope_scale,
+        color = "Risk-bound envelope", linetype = "Risk-bound envelope"),
+    linewidth = 0.7
+  ) +
+  geom_vline(data = min_target_excess_risk,
+             aes(xintercept = alpha),
+             color = COLORPAL[["magenta"]], linetype = "11", linewidth = 0.5) +
+  facet_wrap(vars(geometry), nrow = 1) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.2), expand = expansion(),
+                     labels = c("0", "0.2", "0.4", "0.6", "0.8", "1")) +
+  scale_y_continuous(
+    name = "Target excess risk",
+    expand = expansion(c(0, 0.02), 0),
+    sec.axis = sec_axis(~ . / risk_envelope_scale, name = "Risk-bound envelope")
+  ) +
+  scale_linetype_manual(values = c("solid", "22")) +
+  scale_color_manual(values = unname(COLORPAL[c("magenta", "black")])) +
+  labs(x = NULL, linetype = NULL, color = NULL) +
+  plottheme() +
+  theme(legend.position = "inside",
+        legend.position.inside = c(0.155, 0.81),
+        legend.margin = margin(0, 6, 0, 1),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.text = element_blank(),
+        legend.background = element_rect(fill = "white", color = 'gray20', linewidth = 0.3))
+
+ess_plot <- risk_curves |>
+  select(geometry, alpha, ends_with('ess')) |> 
+  pivot_longer(cols = c(mean_ess, population_ess), names_to = "ess_type", values_to = "ess") |> 
+    mutate(ess_type = recode_values(ess_type,
+                                    "mean_ess" ~ "Avg. ESS fraction",
+                                    "population_ess" ~ "Population ESS fraction")) |>
+  ggplot(aes(alpha, ess)) +
+  geom_line(aes(color = ess_type, linetype = ess_type),
+            linewidth = 0.7) +
+  facet_wrap(vars(geometry), nrow = 1) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.2), expand = expansion(),
+                     labels = c("0", "0.2", "0.4", "0.6", "0.8", "1")) +
+  scale_y_continuous(limits = c(0.92, 1)) +
+  scale_linetype_manual(values = c("solid", "22")) +
+  scale_color_manual(values = unname(COLORPAL[c("magenta", "black")])) +
+  labs(x = expression(alpha), y = "ESS fraction") +
+  plottheme() +
+    labs(color = NULL, linetype = NULL) +
+  theme(legend.position = "inside",
+        legend.position.inside = c(0.165, 0.195),
+        legend.margin = margin(0, 8, 0, 1),
+        strip.text = element_blank(),
+        legend.background = element_rect(fill = "white", color = 'gray20', linewidth = 0.3))
+
+plot_grid(
+  radius_plot,
+  risk_plot,
+  ess_plot,
+  ncol = 1,
+  align = "v",
+  rel_heights = c(0.34, 0.30, 0.36)
+)
+```
+
+

@@ -4,7 +4,7 @@ date: last-modified
 format:
   html:
     embed-resources: true
-
+    
 ---
 
 ## Setup
@@ -20,6 +20,7 @@ library(ggpubr)
 library(ggh4x)
 library(lamW)
 library(kableExtra)
+library(ggrepel)
 source("plotting-utils.R")
 
 NOISE_TYPE <- 'laplace'
@@ -59,137 +60,168 @@ knitr::opts_chunk$set(fig.width  = 6,
 ```{r}
 prob_res <- list.files("results", pattern = sprintf("Pullover_Coat_noise=laplace_%.2f_compute_probabilities_.+_bw%.2f_seed1.csv",
                                                         NOISE_SD, NW_BW),
-                       full.names = TRUE) |>
-  map(~ read_csv(.x, na = c("", "NA", "nan"), col_types = 'cnnnc'))
+                       full.names = TRUE) |> 
+  map(~ read_csv(.x, na = c("", "NA", "nan"), col_types = 'cnnnnc'))
 
-# Z_S <- prob_res |>
-#   filter(str_starts(name, 'Z_S')) |>
-#   select(values...) |>
-#   separate_wider_delim(cols = values..., delim = ",", names_sep = '') |>
+# Z_S <- prob_res |> 
+#   filter(str_starts(name, 'Z_S')) |> 
+#   select(values...) |> 
+#   separate_wider_delim(cols = values..., delim = ",", names_sep = '') |> 
 #   apply(1, as.numeric)
-#
-# Z_T_clean <- prob_res |>
-#   filter(str_starts(name, 'Z_T_clean')) |>
-#   select(values...) |>
-#   separate_wider_delim(cols = values..., delim = ",", names_sep = '') |>
+# 
+# Z_T_clean <- prob_res |> 
+#   filter(str_starts(name, 'Z_T_clean')) |> 
+#   select(values...) |> 
+#   separate_wider_delim(cols = values..., delim = ",", names_sep = '') |> 
 #   apply(1, as.numeric)
 
-# Z_T_noise <- prob_res |>
+# Z_T_noise <- prob_res |> 
 #   map(\(x) {
-#     x |>
-#       filter(str_starts(name, 'Z_T_noise')) |>
-#       select(values...) |>
-#       separate_wider_delim(cols = values..., delim = ",", names_sep = '') |>
+#     x |> 
+#       filter(str_starts(name, 'Z_T_noise')) |> 
+#       select(values...) |> 
+#       separate_wider_delim(cols = values..., delim = ",", names_sep = '') |> 
 #       apply(1, as.numeric)
 #   })
-
+      
 br_weights <- local({
-  tmp <- prob_res |>
+  tmp <- prob_res |> 
     map(\(x) {
-      x |>
-        filter(str_starts(name, 'wgt')) |>
-        separate_longer_delim(cols = values..., delim = ",") |>
-        mutate(wgt = as.numeric(values...)) |>
-        select(-values...) |>
-        group_by(name, alpha, gamma, nu) |>
-        mutate(row = seq_along(wgt)) |>
-        ungroup() |>
+      x |> 
+        filter(str_starts(name, 'wgt')) |> 
+        separate_longer_delim(cols = values..., delim = ",") |> 
+        mutate(wgt = as.numeric(values...)) |> 
+        select(-values...) |> 
+        group_by(name, alpha, gamma, nu, n_capped) |> 
+        mutate(row = seq_along(wgt)) |> 
+        ungroup() |> 
         mutate(type = if_else(str_detect(name, "agn"),
                               "loss-agnostic",
                               "loss-adversarial"))
     })
-
-  bind_rows(tmp[[1]] |>
+  
+  bind_rows(tmp[[1]] |> 
               filter(type == 'loss-agnostic'),
-            tmp |>
+            tmp |> 
               map_dfr(\(brw) {
-                brw |>
+                brw |> 
                   filter(type == 'loss-adversarial')
-              }) |>
-              group_by(type, name, alpha, gamma, nu, row) |>
-              summarize(wgt = first(wgt), .groups = 'drop'))
+              }) |> 
+              group_by(type, name, alpha, gamma, nu, row) |> 
+              summarize(n_capped = first(n_capped),
+                        wgt = first(wgt), .groups = 'drop'))
 })
 
 nw_probs <- local({
-  tmp <- prob_res |>
+  tmp <- prob_res |> 
     map(\(x) {
-      x |>
-        filter(str_starts(name, 'prob')) |>
-        separate_longer_delim(cols = values..., delim = ",") |>
-        mutate(prob = as.numeric(values...)) |>
-        select(-values...) |>
-        group_by(name, alpha, gamma, nu) |>
-        mutate(row = seq_along(prob)) |>
-        ungroup() |>
+      x |> 
+        filter(str_starts(name, 'prob')) |> 
+        separate_longer_delim(cols = values..., delim = ",") |> 
+        mutate(prob = as.numeric(values...)) |> 
+        select(-values...) |> 
+        group_by(name, alpha, gamma, nu, n_capped) |> 
+        mutate(row = seq_along(prob)) |> 
+        ungroup() |> 
         mutate(type = if_else(str_detect(name, "agn"),
                               "loss-agnostic",
                               "loss-adversarial"))
     })
-
-  bind_rows(tmp[[1]] |>
+  
+  bind_rows(tmp[[1]] |> 
               filter(type == 'loss-agnostic'),
-            tmp |>
+            tmp |> 
               map_dfr(\(brw) {
-                brw |>
+                brw |> 
                   filter(type == 'loss-adversarial')
-              }) |>
-              group_by(type, name, alpha, gamma, nu, row) |>
-              summarize(prob = first(prob), .groups = 'drop'))
+              }) |> 
+              group_by(type, name, alpha, gamma, nu, row) |> 
+              summarize(n_capped = first(n_capped),
+                        prob = first(prob), .groups = 'drop'))
 })
 ```
 
 
 ```{r}
 #| label: compute-sensitivity-metrics
-sens_entropy <- nw_probs |>
-  mutate(name = str_remove(name, 'prob_a[gndv]{2}_') |>
-           str_replace('_', '/') |>
+sens_entropy <- nw_probs |> 
+  mutate(name = str_remove(name, 'prob_a[gndv]{2}_') |> 
+           str_replace('_', '/') |> 
            str_to_upper(),
          name = recode_values(name,
                               'KL/KL' ~ 'paste("KL/KL")',
                               'HD/HD' ~ 'paste("HD/HD")',
-                              'KL/HD' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |>
+                              'KL/HD' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |> 
            fct_relevel('paste("KL/KL")', 'paste("HD/HD")'),
-         type = str_to_sentence(type) |>
-           str_replace(fixed('-'), ' ') |>
-           fct_inorder()) |>
-  filter(is.na(gamma) | gamma %in% c(0)) |>
-  group_by(name, type, alpha, nu) |>
+         type = str_to_sentence(type) |> 
+           str_replace(fixed('-'), ' ') |> 
+           fct_inorder()) |> 
+  filter(is.na(gamma) | gamma %in% c(0),
+         is.na(nu) | 
+           (str_detect(name, 'HD/HD') & nu < 2.1) | 
+           (!str_detect(name, 'HD/HD') & nu < 0.3)) |> 
+  group_by(name, type, alpha, nu) |> 
   summarize(entropy = -sum(prob * log(prob) + (1 - prob) * log(1 - prob)),
             .groups = 'drop')
 
-sens_neff <- br_weights |>
-  mutate(name = str_remove(name, 'wgt_a[gndv]{2}_') |>
-           str_replace('_', '/') |>
+sens_neff <- br_weights |> 
+  mutate(name = str_remove(name, 'wgt_a[gndv]{2}_') |> 
+           str_replace('_', '/') |> 
            str_to_upper(),
          name = recode_values(name,
                               'KL/KL' ~ 'paste("KL/KL")',
                               'HD/HD' ~ 'paste("HD/HD")',
-                              'KL/HD' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |>
+                              'KL/HD' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |> 
            fct_relevel('paste("KL/KL")', 'paste("HD/HD")'),
-         type = str_to_sentence(type) |>
-           str_replace(fixed('-'), ' ') |>
-           fct_inorder()) |>
-  filter(is.na(gamma) | gamma %in% c(0)) |>
-  group_by(name, type, alpha, nu) |>
+         type = str_to_sentence(type) |> 
+           str_replace(fixed('-'), ' ') |> 
+           fct_inorder()) |> 
+  filter(is.na(gamma) | gamma %in% c(0),
+         is.na(nu) | 
+           (str_detect(name, 'HD/HD') & nu < 2.1) | 
+           (!str_detect(name, 'HD/HD') & nu < 0.3)) |> 
+  group_by(name, type, alpha, nu) |> 
   mutate(wgt_std = wgt / sum(wgt)) |>
   summarize(neff = 1 / sum(wgt_std^2),
             .groups = 'drop')
 
-sens_class_prop <- nw_probs |>
-  mutate(name = str_remove(name, 'prob_a[gndv]{2}_') |>
-           str_replace('_', '/') |>
+sens_capped <- br_weights |> 
+  mutate(name = str_remove(name, 'wgt_a[gndv]{2}_') |> 
+           str_replace('_', '/') |> 
            str_to_upper(),
          name = recode_values(name,
                               'KL/KL' ~ 'paste("KL/KL")',
                               'HD/HD' ~ 'paste("HD/HD")',
-                              'KL/HD' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |>
+                              'KL/HD' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |> 
            fct_relevel('paste("KL/KL")', 'paste("HD/HD")'),
-         type = str_to_sentence(type) |>
-           str_replace(fixed('-'), ' ') |>
-           fct_inorder()) |>
-  filter(is.na(gamma) | gamma %in% c(0)) |>
-  group_by(name, type, alpha, nu) |>
+         type = str_to_sentence(type) |> 
+           str_replace(fixed('-'), ' ') |> 
+           fct_inorder()) |> 
+  filter(is.na(gamma) | gamma %in% c(0),
+         is.na(nu) | 
+           (str_detect(name, 'HD/HD') & nu < 2.1) | 
+           (!str_detect(name, 'HD/HD') & nu < 0.3)) |> 
+  group_by(name, type, alpha, nu) |> 
+  summarize(prop_capped = n_capped[[1]] / n(),
+            .groups = 'drop')
+
+sens_class_prop <- nw_probs |> 
+  mutate(name = str_remove(name, 'prob_a[gndv]{2}_') |> 
+           str_replace('_', '/') |> 
+           str_to_upper(),
+         name = recode_values(name,
+                              'KL/KL' ~ 'paste("KL/KL")',
+                              'HD/HD' ~ 'paste("HD/HD")',
+                              'KL/HD' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |> 
+           fct_relevel('paste("KL/KL")', 'paste("HD/HD")'),
+         type = str_to_sentence(type) |> 
+           str_replace(fixed('-'), ' ') |> 
+           fct_inorder()) |> 
+  filter(is.na(gamma) | gamma %in% c(0),
+         is.na(nu) | 
+           (str_detect(name, 'HD/HD') & nu < 2.1) | 
+           (!str_detect(name, 'HD/HD') & nu < 0.3)) |> 
+  group_by(name, type, alpha, nu) |> 
   summarize(prop_0 = mean(prob < 0.5),
             lor     = log(prop_0) - log(1 - prop_0),
             .groups = 'drop')
@@ -207,24 +239,32 @@ NU_COLOR_PALETTE <- c('#2d004b','#2166ac','#7fbc41',
 
 ```{r}
 #| label: entropy-sensitivity-nu
-sens_nu_entr_pl <- sens_entropy |>
-  filter(!is.na(nu), !is.na(entropy)) |>
-  group_by(name, nu) |>
+sens_nu_entr_pl <- sens_entropy |> 
+  filter(!is.na(nu), !is.na(entropy)) |> 
+  group_by(name, nu) |> 
   mutate(label = if_else(alpha >= max(alpha) - 1e-8,
                          sprintf("nu==%.3f", nu),
                          NA_character_),
          alpha_label = alpha + 0.01) |>
-  ungroup() |>
-  group_by(name) |>
-  mutate(nu_col = factor(sprintf("%.4f", nu)) |>
-           fct_relabel(~ as.character(seq_along(.x)))) |>
-  ungroup() |>
+  ungroup() |> 
+  group_by(name) |> 
+  mutate(nu_col = factor(sprintf("%.4f", nu)) |> 
+           fct_relabel(~ as.character(seq_along(.x)))) |> 
+  ungroup() |> 
   filter(str_detect(name, fixed("HD/HD")) |
            str_detect(name, fixed("KL/KL")) |
-           str_detect(name, fixed("gamma==0.0"))) |>
+           str_detect(name, fixed("gamma==0.0"))) |> 
   ggplot(aes(x = alpha, y = entropy, color = nu_col)) +
   geom_line() +
-  geom_label(aes(x = alpha_label, label = label), size = 2, parse = TRUE, na.rm = TRUE, hjust = 0) +
+  geom_label_repel(aes(x = alpha_label, label = label), size = 2, parse = TRUE, na.rm = TRUE, 
+                   segment.linetype = '23',
+                   label.padding = 0.15,
+                   box.padding = 0.1,
+                   hjust = 0,
+                   max.time = 2,
+                   force = 0.5,
+                   max.iter = 1e5,
+                   max.overlaps = Inf) +
   facet_grid(cols = vars(name), labeller = label_parsed) +
   scale_x_continuous(expand = expansion(mult = 0, add = c(0.01, 0.25)),
                      breaks = seq(0.05, 0.95, by = 0.30)) +
@@ -236,24 +276,32 @@ sens_nu_entr_pl <- sens_entropy |>
 
 ```{r}
 #| label: neff-sensitivity-nu
-sens_nu_neff_pl <- sens_neff |>
+sens_nu_neff_pl <- sens_neff |> 
   filter(!is.na(nu), !is.na(neff)) |>
-  group_by(name, nu) |>
+  group_by(name, nu) |> 
   mutate(label = if_else(alpha >= max(alpha) - 1e-8,
                          sprintf("nu==%.3f", nu),
                          NA_character_),
          alpha_label = alpha + 0.01) |>
-  ungroup() |>
-  group_by(name) |>
-  mutate(nu_col = factor(sprintf("%.4f", nu)) |>
-           fct_relabel(~ as.character(seq_along(.x)))) |>
-  ungroup() |>
+  ungroup() |> 
+  group_by(name) |> 
+  mutate(nu_col = factor(sprintf("%.4f", nu)) |> 
+           fct_relabel(~ as.character(seq_along(.x)))) |> 
+  ungroup() |> 
   filter(str_detect(name, fixed("HD/HD")) |
            str_detect(name, fixed("KL/KL")) |
-           str_detect(name, fixed("gamma==0.0"))) |>
+           str_detect(name, fixed("gamma==0.0"))) |> 
   ggplot(aes(x = alpha, y = neff, color = nu_col)) +
   geom_line() +
-  geom_label(aes(x = alpha_label, label = label), size = 2, parse = TRUE, na.rm = TRUE, hjust = 0) +
+  geom_label_repel(aes(x = alpha_label, label = label), size = 2, parse = TRUE, na.rm = TRUE, 
+                   segment.linetype = '23',
+                   hjust = 0,
+                   label.padding = 0.15,
+                   box.padding = 0.1,
+                   max.time = 2,
+                   force = 0.5,
+                   max.iter = 1e5,
+                   max.overlaps = Inf) +
   facet_grid(cols = vars(name), labeller = label_parsed) +
   scale_x_continuous(expand = expansion(mult = 0, add = c(0.01, 0.25)),
                      breaks = seq(0.05, 0.95, by = 0.30)) +
@@ -266,25 +314,72 @@ sens_nu_neff_pl <- sens_neff |>
 ```
 
 ```{r}
-#| label: class-prop-sensitivity-nu
-sens_nu_class_prop_pl <- sens_class_prop |>
-  filter(!is.na(nu), !is.na(prop_0)) |>
-  group_by(name, nu) |>
+#| label: capped-sensitivity-nu
+sens_nu_capped_pl <- sens_capped |> 
+  filter(!is.na(nu), !is.na(prop_capped)) |>
+  group_by(name, nu) |> 
   mutate(label = if_else(alpha >= max(alpha) - 1e-8,
                          sprintf("nu==%.3f", nu),
                          NA_character_),
          alpha_label = alpha + 0.01) |>
-  ungroup() |>
-  group_by(name) |>
-  mutate(nu_col = factor(sprintf("%.3f", nu)) |>
-           fct_relabel(~ as.character(seq_along(.x)))) |>
-  ungroup() |>
+  ungroup() |> 
+  group_by(name) |> 
+  mutate(nu_col = factor(sprintf("%.4f", nu)) |> 
+           fct_relabel(~ as.character(seq_along(.x)))) |> 
+  ungroup() |> 
   filter(str_detect(name, fixed("HD/HD")) |
            str_detect(name, fixed("KL/KL")) |
-           str_detect(name, fixed("gamma==0.0"))) |>
+           str_detect(name, fixed("gamma==0.0"))) |> 
+  ggplot(aes(x = alpha, y = prop_capped, color = nu_col)) +
+  geom_line() +
+  geom_label_repel(aes(x = alpha_label, label = label), size = 2, parse = TRUE, na.rm = TRUE, 
+                   segment.linetype = '23',
+                   label.padding = 0.15,
+                   box.padding = 0.1,
+                   hjust = 0,
+                   max.time = 2,
+                   force = 0.5,
+                   max.iter = 1e5,
+                   max.overlaps = Inf) +
+  facet_grid(cols = vars(name), labeller = label_parsed) +
+  scale_x_continuous(expand = expansion(mult = 0, add = c(0.01, 0.25)),
+                     breaks = seq(0.05, 0.95, by = 0.30)) +
+  scale_color_manual(values = NU_COLOR_PALETTE, guide = 'none') +
+  # scale_y_continuous(breaks = seq(3000, 12000, by = 3000),
+  #                    labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+  plottheme() +
+  labs(x = expression(alpha),
+       y = "Prop. capped")
+```
+
+```{r}
+#| label: class-prop-sensitivity-nu
+sens_nu_class_prop_pl <- sens_class_prop |> 
+  filter(!is.na(nu), !is.na(prop_0)) |> 
+  group_by(name, nu) |> 
+  mutate(label = if_else(alpha >= max(alpha) - 1e-8,
+                         sprintf("nu==%.3f", nu),
+                         NA_character_),
+         alpha_label = alpha + 0.01) |>
+  ungroup() |> 
+  group_by(name) |> 
+  mutate(nu_col = factor(sprintf("%.3f", nu)) |> 
+           fct_relabel(~ as.character(seq_along(.x)))) |> 
+  ungroup() |> 
+  filter(str_detect(name, fixed("HD/HD")) |
+           str_detect(name, fixed("KL/KL")) |
+           str_detect(name, fixed("gamma==0.0"))) |> 
   ggplot(aes(x = alpha, y = prop_0, color = nu_col)) +
   geom_line() +
-  geom_label(aes(x = alpha_label, label = label), size = 2, parse = TRUE, na.rm = TRUE, hjust = 0) +
+  geom_label_repel(aes(x = alpha_label, label = label), size = 2, parse = TRUE, na.rm = TRUE, 
+                   segment.linetype = '23',
+                   label.padding = 0.15,
+                   box.padding = 0.1,
+                   hjust = 0,
+                   max.time = 2,
+                   force = 0.5,
+                   max.iter = 1e5,
+                   max.overlaps = Inf) +
   facet_grid(cols = vars(name), labeller = label_parsed) +
   scale_x_continuous(expand = expansion(mult = 0, add = c(0.01, 0.25)),
                      breaks = seq(0.05, 0.95, by = 0.30)) +
@@ -298,29 +393,31 @@ sens_nu_class_prop_pl <- sens_class_prop |>
 #| label: fmnist-sensitivity-nu-combined
 #| fig-width: 6
 #| fig-height: 6
-phs <- c(0.345, 0.305)
-phs <- c(phs, 1 - sum(phs))
-cowplot::ggdraw() +
-  cowplot::draw_plot(sens_nu_neff_pl +
-                       theme(plot.margin = margin(0.2, 0.4, 0.2, 0.01, 'lines'),
-                             axis.title.x = element_blank(),
-                             axis.ticks.x = element_blank(),
-                             axis.text.x = element_blank(),
-                             axis.title.y = element_text(margin = margin(r = 0.26, unit = 'lines'))),
-                     y = sum(phs[1:2]), height = phs[[3]]) +
-  cowplot::draw_plot(sens_nu_entr_pl +
-                       theme(plot.margin = margin(0.2, 0.4, 0.2, 0.01, 'lines'),
-                             axis.title.x = element_blank(),
-                             axis.ticks.x = element_blank(),
-                             axis.text.x = element_blank(),
-                             strip.text = element_blank(),
-                             axis.title.y = element_text(margin = margin(r = 0.05, unit = 'lines'))),
-                     y = phs[1], height = phs[[2]]) +
-  cowplot::draw_plot(sens_nu_class_prop_pl +
-                       theme(strip.text = element_blank(),
-                             axis.title.y = element_text(margin = margin(r = 0.54, unit = 'lines')),
-                             plot.margin = margin(0.2, 0.4, 0.2, 0.01, 'lines')),
-                     y = 0.0, height = phs[[1]])
+plot_grid(
+  sens_nu_capped_pl +
+    theme(axis.title.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.text.x = element_blank(),
+          strip.text = element_blank(),
+          plot.margin = margin(0.2, 0.4, 0.2, 0.01, 'lines')),
+  sens_nu_neff_pl +
+    theme(axis.title.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.text.x = element_blank(),
+          plot.margin = margin(0.2, 0.4, 0.2, 0.01, 'lines')),
+  sens_nu_entr_pl +
+    theme(axis.title.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.text.x = element_blank(),
+          strip.text = element_blank(),
+          plot.margin = margin(0.2, 0.4, 0.2, 0.01, 'lines')),
+  sens_nu_class_prop_pl +
+    theme(strip.text = element_blank(),
+          plot.margin = margin(0.2, 0.4, 0.2, 0.01, 'lines')),
+  ncol = 1,
+  align = "v",
+  rel_heights = c(1, 0.8, 0.8, 1)
+)
 ```
 
 
@@ -330,8 +427,8 @@ From these plots, the optimal $\nu$ for the different bridges are selected as fo
 optim_adv <- tibble(
   name        = c( 'KL/KL',  'HD/HD', 'KL/HD', 'KL/HD', 'KL/HD'),
   gamma       = c(NA_real_, NA_real_,    -0.5,     0.0,     2.0),
-  selected_nu = c(0.0158,     1.0000,  0.0100,  0.1000,  0.3981)
-) |>
+  selected_nu = c(0.039811,   1.0000,  0.0100,  0.1000,  0.3981)
+) |> 
   mutate(model = recode_values(name,
                                'KL/KL' ~ 'nw_adv_klkl',
                                'HD/HD' ~ 'nw_adv_hdhd',
@@ -339,8 +436,8 @@ optim_adv <- tibble(
          name = recode_values(name,
                               'KL/KL' ~ 'paste("KL/KL")',
                               'HD/HD' ~ 'paste("HD/HD")',
-                              'KL/HD' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |>
-           fct_relevel('paste("KL/KL")', 'paste("HD/HD")')) |>
+                              'KL/HD' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |> 
+           fct_relevel('paste("KL/KL")', 'paste("HD/HD")')) |> 
   filter(is.na(gamma) | gamma == 0)
 ```
 
@@ -351,9 +448,9 @@ optim_adv <- tibble(
 #| label: entropy-sensitivity
 #| fig-width: 6
 #| fig-height: 3
-sens_entroyp_pl <- sens_entropy |>
-  left_join(optim_adv, join_by(name)) |>
-  filter(type == 'Loss agnostic' | abs(nu - selected_nu) < 1e-4) |>
+sens_entroyp_pl <- sens_entropy |> 
+  left_join(optim_adv, join_by(name)) |> 
+  filter(type == 'Loss agnostic' | abs(nu - selected_nu) < 1e-4) |> 
   ggplot(aes(x = alpha, y = entropy, color = name)) +
   geom_line(linewidth = 0.8) +
   geom_point(aes(shape = name), size = 3) +
@@ -378,9 +475,9 @@ sens_entroyp_pl
 #| label: neff-sensitivity
 #| fig-width: 6
 #| fig-height: 3
-sens_neff_pl <- sens_neff |>
-  left_join(optim_adv, join_by(name)) |>
-  filter(type == 'Loss agnostic' | abs(nu - selected_nu) < 1e-4) |>
+sens_neff_pl <- sens_neff |> 
+  left_join(optim_adv, join_by(name)) |> 
+  filter(type == 'Loss agnostic' | abs(nu - selected_nu) < 1e-4) |> 
   ggplot(aes(x = alpha, y = neff, color = name)) +
   geom_line(linewidth = 0.8) +
   geom_point(aes(shape = name), size = 3) +
@@ -408,9 +505,9 @@ sens_neff_pl
 #| label: class-imbalance-sensitivity
 #| fig-width: 6
 #| fig-height: 3
-sens_class_prop_pl <- sens_class_prop |>
-  left_join(optim_adv, join_by(name)) |>
-  filter(type == 'Loss agnostic' | abs(nu - selected_nu) < 1e-4) |>
+sens_class_prop_pl <- sens_class_prop |> 
+  left_join(optim_adv, join_by(name)) |> 
+  filter(type == 'Loss agnostic' | abs(nu - selected_nu) < 1e-4) |> 
   ggplot(aes(x = alpha, y = prop_0, color = name)) +
   geom_line(linewidth = 0.8) +
   geom_point(aes(shape = name), size = 3) +
@@ -439,12 +536,12 @@ sens_class_prop_pl
 res <- list.files("results",
                   pattern = sprintf("results_Pullover_Coat_aedim10_%s_sd%.2f_bw%.2f_kernepanechnikov_repl\\d+\\.csv",
                                     NOISE_TYPE, NOISE_SD, NW_BW),
-                  full.names = TRUE) |>
+                  full.names = TRUE) |> 
   map_dfr(~ read_csv(.x, show_col_types = FALSE))
 
 res_sum <- res |>
   mutate(alpha = round(alpha, 2),
-         nu = if_else(is.na(nu), NA_character_, sprintf("%.4f", nu))) |>
+         nu = if_else(is.na(nu), NA_character_, sprintf("%.4f", nu))) |> 
   group_by(noise_type, noise_sd, model, alpha, gamma, nu) |>
   summarize(across(c(accuracy, auc, brier, f1), list(mean = mean, sd = sd)),
             nrepl = n(),
@@ -464,9 +561,9 @@ res_sum <- res |>
 The baseline accuracy is:
 
 ```{r}
-res_sum |>
-  filter(type == 'baseline') |>
-  select(model, ends_with('_mean'), ends_with('_sd')) |>
+res_sum |> 
+  filter(type == 'baseline') |> 
+  select(model, ends_with('_mean'), ends_with('_sd')) |> 
   kbl()
 ```
 
@@ -478,18 +575,18 @@ target_acc_pl <- bind_rows(res_sum |>
                    is.na(gamma) | gamma %in% c(-0.5, 0, 2)),
           res_sum |>
             filter(type == 'loss-adversarial') |>
-            semi_join(select(optim_adv, model, gamma, selected_nu) |>
+            semi_join(select(optim_adv, model, gamma, selected_nu) |> 
                          mutate(nu = sprintf("%.4f", selected_nu)),
-                       join_by(model, gamma, nu))) |>
-  filter(is.na(gamma) | abs(gamma) < 1e-12) |>
+                       join_by(model, gamma, nu))) |> 
+  filter(is.na(gamma) | abs(gamma) < 1e-12) |> 
   mutate(name = recode_values(name,
                               'KLKL' ~ 'paste("KL/KL")',
                               'HDHD' ~ 'paste("HD/HD")',
-                              'KLHD' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |>
+                              'KLHD' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |> 
            fct_relevel('paste("KL/KL")', 'paste("HD/HD")'),
          type = recode_values(type,
                               'loss-agnostic' ~ "Loss agnostic",
-                              'loss-adversarial' ~ "Loss adversarial") |>
+                              'loss-adversarial' ~ "Loss adversarial") |> 
            fct_inorder()) |>
   ggplot(aes(x = alpha, y = accuracy_mean, color = name)) +
   geom_line(linewidth = 0.8) +
@@ -573,23 +670,23 @@ cowplot::ggdraw() +
 #| fig-width: 6
 #| fig-height: 2
 `%ain%` <- function(x, y) {
-  contained <- vapply(y, FUN.VALUE = logical(length(x)), FUN = \(ys) abs(x - ys) < 1e-8) |>
+  contained <- vapply(y, FUN.VALUE = logical(length(x)), FUN = \(ys) abs(x - ys) < 1e-8) |> 
     rowSums()
   contained > 0L
 }
 
 br_wgt_gd <- guide_legend(title = "Bridge", override.aes = list(alpha = 1))
 
-br_weights |>
+br_weights |> 
   filter(type == 'loss-agnostic',
-         alpha %ain% c(0.05, 0.5, 0.95)) |>
+         alpha %ain% c(0.05, 0.5, 0.95)) |> 
   mutate(name = recode_values(name,
                               'wgt_agn_kl_kl' ~ 'paste("KL/KL")',
                               'wgt_agn_hd_hd' ~ 'paste("HD/HD")',
-                              'wgt_agn_kl_hd' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |>
-           fct_relevel('paste("KL/KL")', 'paste("HD/HD")')) |>
+                              'wgt_agn_kl_hd' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |> 
+           fct_relevel('paste("KL/KL")', 'paste("HD/HD")')) |> 
   ggplot(aes(x = wgt)) +
-  geom_density(aes(y = after_stat(scaled),
+  geom_density(aes(y = after_stat(scaled), 
                    color = name,
                    linetype = name,
                    fill = name),
@@ -627,20 +724,20 @@ br_weights |>
 #| label: fminst-bridge-weights-adversarial-density
 #| fig-width: 6
 #| fig-height: 2
-br_weights |>
+br_weights |> 
   filter(type == 'loss-adversarial',
-         alpha %ain% c(0.05, 0.5, 0.95)) |>
-  mutate(model = str_replace(name, 'wgt_', 'nw_') |>
-           str_replace('_([klhd]{2})$', '\\1')) |>
-  inner_join(select(optim_adv, model, gamma, selected_nu), join_by(model, gamma)) |>
+         alpha %ain% c(0.05, 0.5, 0.95)) |> 
+  mutate(model = str_replace(name, 'wgt_', 'nw_') |> 
+           str_replace('_([klhd]{2})$', '\\1')) |> 
+  inner_join(select(optim_adv, model, gamma, selected_nu), join_by(model, gamma)) |> 
   filter(abs(nu - selected_nu) < 1e-4) |>
   mutate(name = recode_values(name,
                               'wgt_adv_kl_kl' ~ 'paste("KL/KL")',
                               'wgt_adv_hd_hd' ~ 'paste("HD/HD")',
-                              'wgt_adv_kl_hd' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |>
-           fct_relevel('paste("KL/KL")', 'paste("HD/HD")')) |>
+                              'wgt_adv_kl_hd' ~ sprintf('paste("KL/H", D[gamma==%.1f])', gamma)) |> 
+           fct_relevel('paste("KL/KL")', 'paste("HD/HD")')) |> 
   ggplot(aes(x = wgt)) +
-  geom_density(aes(y = after_stat(scaled),
+  geom_density(aes(y = after_stat(scaled), 
                    color = name,
                    linetype = name,
                    fill = name),
